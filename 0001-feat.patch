@@ -1,0 +1,551 @@
+From e79e87efe0f232bd7d8af9a569b3019aeb2990a5 Mon Sep 17 00:00:00 2001
+From: takakou32 <takakou32@users.noreply.github.com>
+Date: Mon, 22 Jun 2026 06:52:56 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20=E5=88=9D=E6=9C=9F=E3=83=97=E3=83=AD?=
+ =?UTF-8?q?=E3=82=B8=E3=82=A7=E3=82=AF=E3=83=88=E6=A7=8B=E6=88=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- src/cdp_capture.py: CDP経由でEdgeにアタッチしてキャプチャするメインスクリプト
+- config/config.sample.yaml: YAML設定ファイルサンプル（巡回キャプチャ対応）
+- scripts/start_edge.ps1: デバッグポート付きEdge起動スクリプト
+- README.md: 使用マニュアル（セットアップ・設定・使い方・トラブルシューティング）
+- requirements.txt: playwright, pyyaml
+---
+ .gitignore                |  20 ++++
+ README.md                 | 187 ++++++++++++++++++++++++++++++++++++++
+ config/config.sample.yaml |  47 ++++++++++
+ output/.gitkeep           |   0
+ requirements.txt          |   2 +
+ scripts/start_edge.ps1    |  58 ++++++++++++
+ src/cdp_capture.py        | 164 +++++++++++++++++++++++++++++++++
+ 7 files changed, 478 insertions(+)
+ create mode 100644 .gitignore
+ create mode 100644 README.md
+ create mode 100644 config/config.sample.yaml
+ create mode 100644 output/.gitkeep
+ create mode 100644 requirements.txt
+ create mode 100644 scripts/start_edge.ps1
+ create mode 100644 src/cdp_capture.py
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..4aa927c
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,20 @@
++# Python
++__pycache__/
++*.py[cod]
++*.egg-info/
++dist/
++build/
++.venv/
++venv/
++
++# Config (実環境の設定は含めない)
++config/config.yaml
++
++# Output
++output/*.png
++output/*.jpg
++
++# IDE
++.vscode/
++.idea/
++*.swp
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..0115fa7
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,187 @@
++# CAS Cap
++
++CDP（Chrome DevTools Protocol）経由でEdgeにアタッチし、ブラウザ操作＋スクリーンショットを自動取得するツール。
++
++認証型exeからブラウザを起動する方式のアプリケーションで、従来のBitBlt/PrintScreen方式ではキャプチャできない問題を解決する。
++
++## 仕組み
++
++```
++[Edge + デバッグポート] ← CDP接続 ← [Playwright (本ツール)]
++        ↑
++   [認証exe] がタブを追加
++```
++
++1. Edgeをデバッグポート付きで起動
++2. 認証exeがそのEdgeインスタンスにタブを追加
++3. 本ツールがCDP経由でEdgeに接続し、対象タブを操作＋キャプチャ
++
++Playwrightはブラウザのレンダリングエンジンから直接スクリーンショットを取得するため、ハードウェアアクセラレーションやBitBltの制約を受けない。
++
++## 前提条件
++
++- Python 3.10+
++- Microsoft Edge（Chromiumベース）
++- 認証exeがシステムのEdgeを利用する構成であること
++
++## セットアップ
++
++```bash
++# リポジトリをクローン
++git clone https://github.com/takakou32/cas_cap.git
++cd cas_cap
++
++# 仮想環境作成（推奨）
++python -m venv .venv
++.venv\Scripts\activate
++
++# 依存パッケージインストール
++pip install -r requirements.txt
++
++# Playwrightのブラウザバイナリインストール
++playwright install chromium
++
++# 設定ファイルを作成
++copy config\config.sample.yaml config\config.yaml
++```
++
++## 設定
++
++`config/config.yaml` を編集する。
++
++```yaml
++# CDP接続先
++cdp_url: "http://localhost:9222"
++
++# 対象タブのURLに含まれるキーワード
++target_url_keyword: "your-app-url"
++
++# キャプチャ出力先
++output_dir: "output"
++
++# ページ全体をキャプチャするか
++full_page: true
++```
++
++### 巡回キャプチャ設定
++
++複数画面を自動で巡回してキャプチャする場合は `pages` セクションを追加する。
++
++```yaml
++pages:
++  - name: "top"
++    actions: []
++
++  - name: "search_result"
++    actions:
++      - type: fill
++        selector: "input#search"
++        value: "検索ワード"
++      - type: click
++        selector: "button#search-btn"
++      - type: wait
++        selector: ".result-table"
++
++  - name: "detail"
++    actions:
++      - type: click
++        selector: ".result-table tr:first-child a"
++```
++
++### アクション一覧
++
++| type | 説明 | パラメータ |
++|------|------|-----------|
++| `click` | 要素をクリック | `selector` |
++| `fill` | テキスト入力 | `selector`, `value` |
++| `wait` | 要素の表示を待機 | `selector`, `timeout`(ms) |
++| `goto` | URLに遷移 | `url` |
++| `select` | セレクトボックス選択 | `selector`, `value` |
++| `keyboard` | キー入力 | `key` (例: `"Enter"`, `"Tab"`) |
++
++## 使い方
++
++### 1. Edgeをデバッグポート付きで起動
++
++```powershell
++# PowerShellスクリプトを使う場合
++.\scripts\start_edge.ps1
++
++# 手動で起動する場合
++# まず全Edgeを閉じてから:
++Start-Process "msedge.exe" "--remote-debugging-port=9222"
++```
++
++### 2. 認証exeからアプリを起動
++
++通常通りexeを起動する。アプリがEdgeの新しいタブとして開く。
++
++### 3. タブ一覧を確認
++
++```bash
++python src/cdp_capture.py --list
++```
++
++出力例:
++```
++接続成功。コンテキスト数: 1
++  [0] New Tab - edge://newtab/
++  [1] アプリ名 - https://your-app.example.com/
++```
++
++`target_url_keyword` に設定するキーワードをここで確認する。
++
++### 4. キャプチャ実行
++
++```bash
++# 設定ファイルに従ってキャプチャ
++python src/cdp_capture.py
++
++# 設定ファイルを指定
++python src/cdp_capture.py -c config/my_config.yaml
++```
++
++キャプチャ画像は `output/` ディレクトリに `{timestamp}_{name}.png` 形式で保存される。
++
++## トラブルシューティング
++
++### CDPに接続できない
++
++```
++接続エラー: http://localhost:9222
++```
++
++- Edgeが起動しているか確認: `Get-Process msedge`
++- デバッグポートが有効か確認: `Invoke-RestMethod http://localhost:9222/json`
++- **全Edgeを閉じてから**デバッグポート付きで起動し直す（既存インスタンスがある状態で起動するとデバッグポートが無視される）
++
++### 対象タブが見つからない
++
++```
++対象タブが見つかりません
++```
++
++- `--list` でタブ一覧を確認し、`target_url_keyword` を修正
++- exeからアプリが正しく起動しているか確認
++
++### スクリーンショットが真っ白/真っ黒
++
++- `wait_state` を `"networkidle"` に設定（デフォルト）
++- ページの読み込みに時間がかかる場合は、`pages` の `actions` に `wait` アクションを追加
++
++## ディレクトリ構成
++
++```
++cas_cap/
++├── README.md              # 本ファイル
++├── requirements.txt       # 依存パッケージ
++├── .gitignore
++├── src/
++│   └── cdp_capture.py     # メインスクリプト
++├── config/
++│   ├── config.sample.yaml # 設定サンプル
++│   └── config.yaml        # 実環境設定（.gitignore対象）
++├── output/                # キャプチャ出力先
++└── scripts/
++    └── start_edge.ps1     # Edge起動スクリプト
++```
+diff --git a/config/config.sample.yaml b/config/config.sample.yaml
+new file mode 100644
+index 0000000..f48ba96
+--- /dev/null
++++ b/config/config.sample.yaml
+@@ -0,0 +1,47 @@
++# CAS Cap 設定ファイル
++# このファイルを config/config.yaml にコピーして編集してください
++
++# CDP接続先
++cdp_url: "http://localhost:9222"
++
++# 対象タブのURLに含まれるキーワード
++# タブ一覧は python src/cdp_capture.py --list で確認可能
++target_url_keyword: "your-app-url"
++
++# キャプチャ出力先ディレクトリ
++output_dir: "output"
++
++# ページ全体をキャプチャするか（false: 表示領域のみ）
++full_page: true
++
++# ページ読み込み待機の種類
++# "networkidle" | "load" | "domcontentloaded"
++wait_state: "networkidle"
++
++# 巡回キャプチャ設定（省略時は現在表示中の画面のみキャプチャ）
++# pages:
++#   - name: "top"
++#     actions: []
++#
++#   - name: "search_result"
++#     actions:
++#       - type: fill
++#         selector: "input#search"
++#         value: "検索ワード"
++#       - type: click
++#         selector: "button#search-btn"
++#       - type: wait
++#         selector: ".result-table"
++#
++#   - name: "detail"
++#     actions:
++#       - type: click
++#         selector: ".result-table tr:first-child a"
++#
++# アクションの種類:
++#   click:    { type: click, selector: "..." }
++#   fill:     { type: fill, selector: "...", value: "..." }
++#   wait:     { type: wait, selector: "...", timeout: 5000 }
++#   goto:     { type: goto, url: "https://..." }
++#   select:   { type: select, selector: "...", value: "..." }
++#   keyboard: { type: keyboard, key: "Enter" }
+diff --git a/output/.gitkeep b/output/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..fff287f
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,2 @@
++playwright>=1.40.0
++pyyaml>=6.0
+diff --git a/scripts/start_edge.ps1 b/scripts/start_edge.ps1
+new file mode 100644
+index 0000000..ae4d975
+--- /dev/null
++++ b/scripts/start_edge.ps1
+@@ -0,0 +1,58 @@
++<#
++.SYNOPSIS
++    デバッグポート付きでEdgeを起動する
++
++.DESCRIPTION
++    既存のEdgeプロセスを確認し、デバッグポート付きでEdgeを起動する。
++    既にEdgeが起動している場合は警告を出す。
++
++.PARAMETER Port
++    CDPデバッグポート番号（デフォルト: 9222）
++#>
++
++param(
++    [int]$Port = 9222
++)
++
++# 既存のEdgeプロセスを確認
++$existingEdge = Get-Process -Name "msedge" -ErrorAction SilentlyContinue
++if ($existingEdge) {
++    Write-Warning "Edgeが既に起動しています。デバッグポートを有効にするには、全てのEdgeを閉じてから再実行してください。"
++    Write-Host ""
++    Write-Host "全Edgeを終了するには:"
++    Write-Host "  Stop-Process -Name msedge -Force"
++    Write-Host ""
++    $confirm = Read-Host "Edgeを強制終了して続行しますか？ (y/N)"
++    if ($confirm -eq "y") {
++        Stop-Process -Name msedge -Force
++        Start-Sleep -Seconds 2
++    } else {
++        Write-Host "中断しました。"
++        exit 1
++    }
++}
++
++# デバッグポート付きでEdgeを起動
++Write-Host "Edge起動中 (CDP port: $Port)..."
++Start-Process "msedge.exe" "--remote-debugging-port=$Port"
++
++# ポートの待機
++Write-Host "CDPポートの起動を待機中..."
++$maxRetry = 10
++for ($i = 0; $i -lt $maxRetry; $i++) {
++    Start-Sleep -Seconds 1
++    try {
++        $response = Invoke-RestMethod "http://localhost:$Port/json/version" -ErrorAction Stop
++        Write-Host "CDP接続確認OK"
++        Write-Host "  Browser: $($response.Browser)"
++        Write-Host "  WebSocket: $($response.webSocketDebuggerUrl)"
++        Write-Host ""
++        Write-Host "次のステップ: exeからアプリを起動してください"
++        exit 0
++    } catch {
++        Write-Host "  待機中... ($($i + 1)/$maxRetry)"
++    }
++}
++
++Write-Warning "CDPポートの起動を確認できませんでした。手動で確認してください:"
++Write-Host "  Invoke-RestMethod http://localhost:$Port/json"
+diff --git a/src/cdp_capture.py b/src/cdp_capture.py
+new file mode 100644
+index 0000000..bb4fe33
+--- /dev/null
++++ b/src/cdp_capture.py
+@@ -0,0 +1,164 @@
++"""
++CAS Cap - CDP経由でEdgeにアタッチし、ブラウザ操作＋スクリーンショットを取得する
++
++前提:
++  1. Edgeを全プロセス終了
++  2. scripts/start_edge.ps1 でデバッグポート付きEdgeを起動
++  3. exeからアプリを起動（Edgeにタブが追加される）
++  4. このスクリプトを実行
++"""
++
++import asyncio
++import argparse
++import sys
++from datetime import datetime
++from pathlib import Path
++
++import yaml
++from playwright.async_api import async_playwright
++
++
++def load_config(config_path: str = "config/config.yaml") -> dict:
++    """設定ファイルを読み込む"""
++    path = Path(config_path)
++    if not path.exists():
++        print(f"設定ファイルが見つかりません: {config_path}")
++        print("config/config.sample.yaml をコピーして config/config.yaml を作成してください")
++        sys.exit(1)
++    with open(path, encoding="utf-8") as f:
++        return yaml.safe_load(f)
++
++
++async def list_tabs(cdp_url: str):
++    """接続中のEdgeのタブ一覧を表示する"""
++    async with async_playwright() as p:
++        browser = await p.chromium.connect_over_cdp(cdp_url)
++        print(f"接続成功。コンテキスト数: {len(browser.contexts)}")
++        for ctx in browser.contexts:
++            for i, page in enumerate(ctx.pages):
++                print(f"  [{i}] {page.title}")
++                print(f"      {page.url}")
++        browser.close()
++
++
++async def find_target_page(browser, target_url_keyword: str):
++    """URLキーワードに一致するタブを探す"""
++    for ctx in browser.contexts:
++        for page in ctx.pages:
++            if target_url_keyword in page.url:
++                return page
++    return None
++
++
++async def capture(config: dict):
++    """メインのキャプチャ処理"""
++    cdp_url = config.get("cdp_url", "http://localhost:9222")
++    target_keyword = config.get("target_url_keyword", "")
++    output_dir = Path(config.get("output_dir", "output"))
++    full_page = config.get("full_page", True)
++    wait_state = config.get("wait_state", "networkidle")
++    pages_config = config.get("pages", [])
++
++    output_dir.mkdir(parents=True, exist_ok=True)
++    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++
++    async with async_playwright() as p:
++        browser = await p.chromium.connect_over_cdp(cdp_url)
++        print(f"Edge接続成功")
++
++        # 対象タブを探す
++        target_page = await find_target_page(browser, target_keyword)
++        if target_page is None:
++            print(f"対象タブが見つかりません (keyword: {target_keyword})")
++            print("タブ一覧:")
++            for ctx in browser.contexts:
++                for page in ctx.pages:
++                    print(f"  {page.url}")
++            browser.close()
++            sys.exit(1)
++
++        print(f"対象タブ: {target_page.title}")
++        await target_page.wait_for_load_state(wait_state)
++
++        if not pages_config:
++            # ページ設定がなければ現在の画面をキャプチャ
++            filename = output_dir / f"capture_{timestamp}.png"
++            await target_page.screenshot(path=str(filename), full_page=full_page)
++            print(f"キャプチャ保存: {filename}")
++        else:
++            # 複数画面を巡回キャプチャ
++            for i, page_conf in enumerate(pages_config):
++                name = page_conf.get("name", f"page_{i:03d}")
++                actions = page_conf.get("actions", [])
++
++                # アクション実行
++                for action in actions:
++                    await execute_action(target_page, action)
++
++                await target_page.wait_for_load_state(wait_state)
++
++                filename = output_dir / f"{timestamp}_{name}.png"
++                await target_page.screenshot(path=str(filename), full_page=full_page)
++                print(f"キャプチャ保存: {filename}")
++
++        browser.close()
++        print("完了")
++
++
++async def execute_action(page, action: dict):
++    """ページ上でアクションを実行する"""
++    action_type = action.get("type")
++
++    if action_type == "click":
++        selector = action["selector"]
++        await page.click(selector)
++
++    elif action_type == "fill":
++        selector = action["selector"]
++        value = action["value"]
++        await page.fill(selector, value)
++
++    elif action_type == "wait":
++        selector = action.get("selector")
++        timeout = action.get("timeout", 5000)
++        if selector:
++            await page.wait_for_selector(selector, timeout=timeout)
++        else:
++            await page.wait_for_timeout(timeout)
++
++    elif action_type == "goto":
++        url = action["url"]
++        await page.goto(url)
++
++    elif action_type == "select":
++        selector = action["selector"]
++        value = action["value"]
++        await page.select_option(selector, value)
++
++    elif action_type == "keyboard":
++        key = action["key"]
++        await page.keyboard.press(key)
++
++    else:
++        print(f"  未知のアクション: {action_type}")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="CAS Cap - CDP経由ブラウザキャプチャツール")
++    parser.add_argument("-c", "--config", default="config/config.yaml", help="設定ファイルパス")
++    parser.add_argument("--list", action="store_true", help="タブ一覧を表示")
++    parser.add_argument("--cdp-url", default=None, help="CDPのURL (デフォルト: config参照)")
++    args = parser.parse_args()
++
++    if args.list:
++        cdp_url = args.cdp_url or "http://localhost:9222"
++        asyncio.run(list_tabs(cdp_url))
++    else:
++        config = load_config(args.config)
++        if args.cdp_url:
++            config["cdp_url"] = args.cdp_url
++        asyncio.run(capture(config))
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

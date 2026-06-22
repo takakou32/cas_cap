@@ -1,0 +1,47 @@
+# CAS Cap 設定ファイル
+# このファイルを config/config.yaml にコピーして編集してください
+
+# CDP接続先
+cdp_url: "http://localhost:9222"
+
+# 対象タブのURLに含まれるキーワード
+# タブ一覧は python src/cdp_capture.py --list で確認可能
+target_url_keyword: "your-app-url"
+
+# キャプチャ出力先ディレクトリ
+output_dir: "output"
+
+# ページ全体をキャプチャするか（false: 表示領域のみ）
+full_page: true
+
+# ページ読み込み待機の種類
+# "networkidle" | "load" | "domcontentloaded"
+wait_state: "networkidle"
+
+# 巡回キャプチャ設定（省略時は現在表示中の画面のみキャプチャ）
+# pages:
+#   - name: "top"
+#     actions: []
+#
+#   - name: "search_result"
+#     actions:
+#       - type: fill
+#         selector: "input#search"
+#         value: "検索ワード"
+#       - type: click
+#         selector: "button#search-btn"
+#       - type: wait
+#         selector: ".result-table"
+#
+#   - name: "detail"
+#     actions:
+#       - type: click
+#         selector: ".result-table tr:first-child a"
+#
+# アクションの種類:
+#   click:    { type: click, selector: "..." }
+#   fill:     { type: fill, selector: "...", value: "..." }
+#   wait:     { type: wait, selector: "...", timeout: 5000 }
+#   goto:     { type: goto, url: "https://..." }
+#   select:   { type: select, selector: "...", value: "..." }
+#   keyboard: { type: keyboard, key: "Enter" }

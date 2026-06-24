@@ -1,0 +1,9 @@
+{
+  "cdp_url": "http://localhost:9222",
+  "target_url_keyword": "your-app-url",
+  "output_dir": "output",
+  "full_page": true,
+  "wait_state": "networkidle",
+  "settle_ms": 800,
+  "pages": []
+}

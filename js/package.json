@@ -1,0 +1,15 @@
+{
+  "name": "cas-cap-js",
+  "version": "1.0.0",
+  "description": "CDP経由でEdgeにアタッチし、ブラウザ操作＋スクリーンショットを取得するツール (JavaScript版)",
+  "bin": {
+    "cas-cap": "cdp_capture.js"
+  },
+  "scripts": {
+    "start": "node cdp_capture.js",
+    "list": "node cdp_capture.js --list"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}

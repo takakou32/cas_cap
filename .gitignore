@@ -7,8 +7,13 @@ build/
 .venv/
 venv/
 
+# Node.js (JavaScript版)
+node_modules/
+package-lock.json
+
 # Config (実環境の設定は含めない)
 config/config.yaml
+config/config.json
 
 # Output
 output/*.png

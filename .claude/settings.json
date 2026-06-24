@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($errors = $null; $tokens = $null; [System.Management.Automation.Language.Parser]::ParseFile\\(\"c:\\\\work\\\\cas_cap\\\\powershell\\\\cdp_capture.ps1\", [ref]$tokens, [ref]$errors\\) | Out-Null; if \\($errors\\) { $errors | ForEach-Object { Write-Host \"ERROR: $\\($_.Message\\) \\(line $\\($_.Extent.StartLineNumber\\)\\)\" } } else { Write-Host \"PowerShell syntax OK\" })"
+    ]
+  }
+}

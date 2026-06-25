@@ -142,6 +142,28 @@ function Invoke-PageScript {
     return $result.result.value
 }
 
+# ページ遷移中はJS実行コンテキストが破棄され Runtime.evaluate が失敗する。
+# 遷移由来の一時的エラーは少し待って新しいコンテキストでリトライする。
+function Invoke-PageScriptSafe {
+    param($Ws, [string]$Expression, [bool]$AwaitPromise = $false, [int]$Retries = 40)
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            return Invoke-PageScript -Ws $Ws -Expression $Expression -AwaitPromise $AwaitPromise
+        } catch {
+            $msg = "$_"
+            if ($msg -match "Execution context was destroyed" -or
+                $msg -match "Cannot find context" -or
+                $msg -match "Inspected target navigated or closed" -or
+                $msg -match "uniqueContextId") {
+                Start-Sleep -Milliseconds 200
+                continue
+            }
+            throw
+        }
+    }
+    throw "ページ評価がナビゲーションにより安定しませんでした"
+}
+
 # 文字列を安全なJSリテラルに変換（JSON文字列はJS文字列としても妥当）
 function ConvertTo-JsLiteral {
     param([string]$Value)
@@ -178,7 +200,7 @@ new Promise((resolve, reject) => {
   })();
 })
 "@
-        Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+        Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
     }
 
     # 2) readyState完了 ＋ DOM安定待ち（コンテンツの挿入が止まるまで）
@@ -205,7 +227,7 @@ new Promise((resolve) => {
   })();
 })
 "@
-    Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+    Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
 
     if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
 }

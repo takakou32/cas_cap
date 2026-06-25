@@ -38,7 +38,7 @@
                       "actions":  [
                                       {
                                           "type":  "goto",
-                                          "url":  "https://zenn.dev/nomhiro/articles/poc-develop-use-github-copilot-app"
+                                          "url":  "https://zenn.dev/olibrauma/articles/tauri-library-for-cli-tool"
                                       }
                                   ]
                   },
@@ -47,52 +47,7 @@
                       "actions":  [
                                       {
                                           "type":  "goto",
-                                          "url":  "https://zenn.dev/"
-                                      }
-                                  ]
-                  },
-                  {
-                      "name":  "recorded_006",
-                      "actions":  [
-                                      {
-                                          "type":  "goto",
-                                          "url":  "https://zenn.dev/ncdc/articles/bb8ffdd1a874ea"
-                                      }
-                                  ]
-                  },
-                  {
-                      "name":  "recorded_007",
-                      "actions":  [
-                                      {
-                                          "type":  "goto",
-                                          "url":  "https://zenn.dev/"
-                                      }
-                                  ]
-                  },
-                  {
-                      "name":  "recorded_008",
-                      "actions":  [
-                                      {
-                                          "type":  "goto",
-                                          "url":  "https://zenn.dev/articles/explore#ideas"
-                                      }
-                                  ]
-                  },
-                  {
-                      "name":  "recorded_009",
-                      "actions":  [
-                                      {
-                                          "type":  "goto",
-                                          "url":  "https://zenn.dev/safubuki/articles/turtle-20250502-gem"
-                                      }
-                                  ]
-                  },
-                  {
-                      "name":  "recorded_010",
-                      "actions":  [
-                                      {
-                                          "type":  "goto",
-                                          "url":  "https://zenn.dev/articles/explore#ideas"
+                                          "url":  "https://zenn.dev/contests/splunk-opentelemetry-2026"
                                       }
                                   ]
                   }

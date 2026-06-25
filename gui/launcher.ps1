@@ -22,20 +22,21 @@ $RepoRoot = Split-Path $PSScriptRoot -Parent
 function Start-InConsole {
     param([string]$Command)
 
-    # 本体は子PowerShellで実行する。これにより cdp_capture.ps1 内の exit / 例外でも
-    # 終了コードを親が受け取れる。引数の引用符崩れを避けるため EncodedCommand を使う。
+    # 引用符の受け渡し崩れを避けるため、内側・外側とも EncodedCommand 化する。
+    # 内側: 本体を子PowerShellで実行（cdp_capture.ps1 内の exit / 例外でも終了コードを取得できる）
     $inner = "Set-Location -LiteralPath '$RepoRoot'; $Command"
-    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+    $innerEnc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
 
-    # 親ウィンドウ: 子を実行 → 成功なら自動で閉じる / 失敗時のみ内容を読めるよう一時停止
-    $wrapper = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc; " +
+    # 外側(親ウィンドウ): 内側を実行 → 成功なら自動で閉じる / 失敗時のみ一時停止
+    $wrapper = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $innerEnc; " +
                "if (`$LASTEXITCODE -ne 0) { Write-Host ''; " +
-               "Write-Host (`"エラーで終了しました (コード: `$LASTEXITCODE)`") -ForegroundColor Red; " +
+               "Write-Host 'エラーで終了しました。内容を確認してください。' -ForegroundColor Red; " +
                "[void](Read-Host 'Enter キーで閉じます') }"
+    $wrapperEnc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
 
     # -WorkingDirectory で .NET/Node の相対パス基準もリポジトリルートに揃える（-NoExit は付けない）
     Start-Process powershell -WorkingDirectory $RepoRoot -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $wrapper
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $wrapperEnc
     )
 }
 

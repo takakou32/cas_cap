@@ -551,10 +551,29 @@ $script:RecorderJs = @'
     return parts.join(" > ");
   }
   function push(ev){ try{ ev.url=location.href; var k="__capRec"; var arr=JSON.parse(localStorage.getItem(k)||"[]"); arr.push(ev); localStorage.setItem(k,JSON.stringify(arr)); }catch(e){} }
+  // クリックを記録（ページ内タブ切替・ボタン・リンク等）。
+  // 標準的なクリック対象が無ければ cursor:pointer の要素でカスタムタブも拾う。
+  document.addEventListener("click", function(e){
+    var t=e.target.closest("a,button,[role=button],[role=tab],[role=menuitem],[role=link],[onclick],[tabindex]");
+    if(!t){
+      var el=e.target;
+      if(el && el!==document.body && el!==document.documentElement){
+        var cur=""; try{ cur=getComputedStyle(el).cursor; }catch(_){}
+        if(cur==="pointer"){ t=el; }
+      }
+    }
+    if(!t) return;
+    var tg=(t.tagName||"").toLowerCase();
+    if(tg==="input"||tg==="textarea"){
+      var ty=(t.type||"").toLowerCase();
+      if(ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio") return; // テキスト入力はfillで扱う
+    }
+    push({type:"click", selector:cssPath(t)});
+  }, true);
   document.addEventListener("change", function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
     if(tag==="select"){ push({type:"select", selector:cssPath(el), value:el.value}); }
-    else if(el.type==="checkbox"||el.type==="radio"){ /* 遷移はgotoで再現するため記録しない */ }
+    else if(el.type==="checkbox"||el.type==="radio"){ /* クリックで記録済み */ }
     else if(tag==="input"||tag==="textarea"){ push({type:"fill", selector:cssPath(el), value:el.value}); }
   }, true);
 })();
@@ -595,45 +614,79 @@ function Save-RecordedConfig {
     [System.IO.File]::WriteAllText($OutPath, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# ドレイン結果(JSON文字列)を解釈し、URL遷移と入力イベントを記録に反映する
+# 1撮影ポイント=1ページを確定する。直前までの入力(pending)＋指定アクションを束ねる。
+function Add-RecPage {
+    param($Action, [bool]$Verbose)   # $Action: click/goto の ordered ハッシュ、または $null(入力のみ確定)
+    $acts = New-Object System.Collections.ArrayList
+    foreach ($p in $script:RecPending) { [void]$acts.Add($p) }
+    $script:RecPending.Clear()
+    if ($Action) { [void]$acts.Add($Action) }
+    if ($acts.Count -eq 0) { return }
+    $script:RecIdx++
+    $name = "{0}_{1:D3}" -f $script:RecPageName, $script:RecIdx
+    [void]$script:RecPages.Add([ordered]@{ name = $name; actions = $acts })
+    if ($Verbose) {
+        $desc = if ($Action) {
+            switch ($Action.type) {
+                "click" { "click $($Action.selector)" }
+                "goto"  { "goto $($Action.url)" }
+                default { $Action.type }
+            }
+        } else { "(入力のみ)" }
+        Write-Host "  画面 $($script:RecPages.Count): $desc"
+    }
+}
+
+# ドレイン結果(JSON文字列)を解釈し、クリック・入力・URL遷移を順序どおりに撮影ポイント化する
 function Add-RecordSample {
-    param([string]$Json, $Visited, [hashtable]$FillsByUrl, [ref]$LastUrl, [bool]$Verbose)
+    param([string]$Json, [bool]$Verbose)
     if (-not $Json) { return }
     $obj = $null
     try { $obj = $Json | ConvertFrom-Json } catch { return }
     if (-not $obj) { return }
 
-    # 画面遷移の検出（直前と異なるURLになったら1画面として記録）
-    if ($obj.url -and $obj.url -ne $LastUrl.Value) {
-        # SPA判定: 同一オリジンでURLが変わったのにロード回数が増えていない＝ソフト遷移
-        if ($LastUrl.Value) {
-            $sameOrigin = $false
-            try { $sameOrigin = (([Uri]$obj.url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$LastUrl.Value).GetLeftPart([System.UriPartial]::Authority)) } catch {}
-            $load = [int]$obj.load
-            if ($sameOrigin -and $load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
+    # 1) イベント(クリック/入力)を発生順に処理
+    foreach ($e in @($obj.events)) {
+        if ($e.type -eq "click") {
+            # クリックは1撮影ポイント（ページ内タブ切替・遷移リンク等）
+            Add-RecPage -Action ([ordered]@{ type = "click"; selector = $e.selector }) -Verbose $Verbose
+            $script:RecLastWasClick = $true
         }
-        [void]$Visited.Add($obj.url)
-        $LastUrl.Value = $obj.url
-        if ($Verbose) { Write-Host "  画面 $($Visited.Count): $($obj.url)" }
+        elseif ($e.type -eq "fill" -or $e.type -eq "select") {
+            # 入力は次の撮影ポイントまで保留（同一セレクタは最後の値で上書き）
+            $act = [ordered]@{ type = $e.type; selector = $e.selector; value = $e.value }
+            $prev = if ($script:RecPending.Count -gt 0) { $script:RecPending[$script:RecPending.Count - 1] } else { $null }
+            if ($prev -and $prev.type -eq $act.type -and $prev.selector -eq $act.selector) {
+                $script:RecPending[$script:RecPending.Count - 1] = $act
+            } else {
+                [void]$script:RecPending.Add($act)
+            }
+            if ($Verbose) { Write-Host "    + 入力 $($act.selector) = $($act.value)" }
+        }
+    }
+
+    # 2) URL変化の処理（イベント処理の後）
+    $url = $obj.url
+    if ($url -and $url -ne $script:RecLastUrl) {
+        # SPA判定: 同一オリジンでURLが変わったのにロード回数が増えていない＝ソフト遷移
+        if ($script:RecLastUrl) {
+            $sameOrigin = $false
+            try { $sameOrigin = (([Uri]$url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$script:RecLastUrl).GetLeftPart([System.UriPartial]::Authority)) } catch {}
+            if ($sameOrigin -and [int]$obj.load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
+        }
+        if ($script:RecLastWasClick) {
+            # 直前のクリックが遷移を起こした → クリックで再現できるので goto は入れない
+            $script:RecLastWasClick = $false
+        } else {
+            # クリック由来でない遷移（初期表示/戻る/プログラム遷移）→ goto を撮影ポイントに
+            Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose
+        }
+        $script:RecLastUrl = $url
+    } else {
+        # URLは不変。直前クリックがページ内遷移(タブ等)だった場合は既にclickページ済み
+        if ($script:RecLastWasClick) { $script:RecLastWasClick = $false }
     }
     if ($null -ne $obj.load) { $script:RecLastLoad = [int]$obj.load }
-
-    # 入力(fill/select)をその画面のURLに紐付けて蓄積（同一セレクタは最後の値で上書き）
-    foreach ($e in @($obj.events)) {
-        if ($e.type -ne "fill" -and $e.type -ne "select") { continue }
-        $eu = if ($e.url) { $e.url } else { $LastUrl.Value }
-        if (-not $eu) { continue }
-        if (-not $FillsByUrl.ContainsKey($eu)) { $FillsByUrl[$eu] = New-Object System.Collections.ArrayList }
-        $lst = $FillsByUrl[$eu]
-        $act = [ordered]@{ type = $e.type; selector = $e.selector; value = $e.value }
-        $prev = if ($lst.Count -gt 0) { $lst[$lst.Count - 1] } else { $null }
-        if ($prev -and $prev.type -eq $act.type -and $prev.selector -eq $act.selector) {
-            $lst[$lst.Count - 1] = $act
-        } else {
-            [void]$lst.Add($act)
-        }
-        if ($Verbose) { Write-Host "    + 入力 $($act.selector) = $($act.value)" }
-    }
 }
 
 function Start-Recording {
@@ -655,11 +708,14 @@ function Start-Recording {
     Write-Host "記録対象タブ: $($target.title)"
 
     $ws = Connect-CdpSocket -WsUrl $target.webSocketDebuggerUrl
-    $visited    = New-Object System.Collections.ArrayList   # 遷移した順のURL（連続重複は除く）
-    $fillsByUrl = @{}                                        # URL -> その画面で行った入力(fill/select)
-    $lastUrl    = $null
-    $script:RecLastLoad = 0       # 直近のドキュメントロード回数
-    $script:RecSawSpa   = $false  # SPAソフト遷移を1度でも検出したか
+    $script:RecPages       = New-Object System.Collections.ArrayList  # 確定した撮影ページ（順序どおり）
+    $script:RecPending     = New-Object System.Collections.ArrayList  # 次の撮影ポイントまで保留する入力
+    $script:RecLastUrl     = $null
+    $script:RecLastWasClick = $false
+    $script:RecLastLoad    = 0       # 直近のドキュメントロード回数
+    $script:RecSawSpa      = $false  # SPAソフト遷移を1度でも検出したか
+    $script:RecPageName    = $PageName
+    $script:RecIdx         = 0
     try {
         Invoke-CdpCommand -Ws $ws -Method "Page.enable" | Out-Null
         Invoke-CdpCommand -Ws $ws -Method "Runtime.enable" | Out-Null
@@ -673,17 +729,15 @@ function Start-Recording {
 
         Write-Host ""
         Write-Host "=== 操作記録を開始しました ==="
-        Write-Host "ブラウザで画面を遷移してください。遷移した画面を順にキャプチャ対象として記録します。"
-        Write-Host "（入力(fill)・選択(select)も記録します。クリック等の遷移は goto で再現します）"
+        Write-Host "ブラウザを操作してください。クリック（ページ内タブ切替を含む）・画面遷移・入力を順に記録します。"
+        Write-Host "各クリック／遷移ごとに1枚キャプチャする設定になります。"
         Write-Host "記録を終了するには、このウィンドウで Enter キーを押してください。"
         Write-Host ""
 
         while ($true) {
             $json = $null
             try { $json = Invoke-PageScript -Ws $ws -Expression $script:DrainJs } catch { $json = $null }
-            $ref = [ref]$lastUrl
-            Add-RecordSample -Json $json -Visited $visited -FillsByUrl $fillsByUrl -LastUrl $ref -Verbose $true
-            $lastUrl = $ref.Value
+            Add-RecordSample -Json $json -Verbose $true
 
             if ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
@@ -692,12 +746,11 @@ function Start-Recording {
             Start-Sleep -Milliseconds 400
         }
 
-        # 終了直前の状態を回収
+        # 終了直前の状態を回収し、保留中の入力があれば最後のページとして確定
         $json = $null
         try { $json = Invoke-PageScript -Ws $ws -Expression $script:DrainJs } catch { $json = $null }
-        $ref = [ref]$lastUrl
-        Add-RecordSample -Json $json -Visited $visited -FillsByUrl $fillsByUrl -LastUrl $ref -Verbose $false
-        $lastUrl = $ref.Value
+        Add-RecordSample -Json $json -Verbose $false
+        Add-RecPage -Action $null -Verbose $false
     } finally {
         try {
             $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done",
@@ -706,19 +759,7 @@ function Start-Recording {
         $ws.Dispose()
     }
 
-    # 訪れた画面ごとに「goto + その画面での入力」= 1ページ（再生時に各画面を1枚ずつ撮影）
-    $pages = New-Object System.Collections.ArrayList
-    $idx = 0
-    foreach ($u in $visited) {
-        $idx++
-        $acts = New-Object System.Collections.ArrayList
-        [void]$acts.Add([ordered]@{ type = "goto"; url = $u })
-        if ($fillsByUrl.ContainsKey($u)) {
-            foreach ($a in $fillsByUrl[$u]) { [void]$acts.Add($a) }
-        }
-        $pname = "{0}_{1:D3}" -f $PageName, $idx
-        [void]$pages.Add([ordered]@{ name = $pname; actions = @($acts) })
-    }
+    $pages = $script:RecPages
 
     Write-Host ""
     Write-Host "記録した画面数: $($pages.Count)"

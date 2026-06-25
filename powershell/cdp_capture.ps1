@@ -149,21 +149,64 @@ function ConvertTo-JsLiteral {
 }
 
 # ---------------------------------------------------------------------------
-# 待機処理（networkidle相当はreadyState完了＋settle待ちで近似）
+# 待機処理
+#   1) ready_selector が指定されていれば、その要素が表示されるまで待つ
+#   2) readyState=complete かつ DOMが stable_ms の間変化しなくなるまで待つ（最大 timeout）
+#   3) 仕上げに settle_ms 待つ
+# これにより「readyStateはcompleteだが中身はまだローディング中」を撮ってしまうのを防ぐ。
+# stable_ms / load_timeout_ms / ready_selector は $script: 変数で上書き可（Invoke-Captureで設定）。
 # ---------------------------------------------------------------------------
 function Wait-PageReady {
-    param($Ws, [int]$SettleMs = 800, [int]$TimeoutMs = 30000)
-    $expr = @"
+    param($Ws, [int]$SettleMs = 800, [int]$TimeoutMs = 0)
+
+    $timeout  = if ($TimeoutMs -gt 0) { $TimeoutMs }
+                elseif ($script:LoadTimeoutMs) { [int]$script:LoadTimeoutMs } else { 30000 }
+    $stable   = if ($null -ne $script:StableMs) { [int]$script:StableMs } else { 1000 }
+    $selector = if ($script:ReadySelector) { [string]$script:ReadySelector } else { "" }
+
+    # 1) 目印要素の出現待ち（任意）
+    if ($selector) {
+        $sel = ConvertTo-JsLiteral $selector
+        $expr = @"
 new Promise((resolve, reject) => {
-  const deadline = Date.now() + $TimeoutMs;
+  const deadline = Date.now() + $timeout;
   (function check() {
-    if (document.readyState === 'complete') return resolve(true);
-    if (Date.now() > deadline) return reject(new Error('readyState timeout'));
+    const el = document.querySelector($sel);
+    if (el && el.offsetParent !== null) return resolve(true);
+    if (Date.now() > deadline) return reject(new Error('ready_selector timeout: ' + $sel));
+    setTimeout(check, 100);
+  })();
+})
+"@
+        Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+    }
+
+    # 2) readyState完了 ＋ DOM安定待ち（コンテンツの挿入が止まるまで）
+    $expr = @"
+new Promise((resolve) => {
+  const idle = $stable, deadline = Date.now() + $timeout;
+  let last = Date.now();
+  let obs = null;
+  try {
+    obs = new MutationObserver(() => { last = Date.now(); });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  (function check() {
+    const now = Date.now();
+    if (document.readyState === 'complete' && (now - last) >= idle) {
+      if (obs) obs.disconnect();
+      return resolve('idle');
+    }
+    if (now > deadline) {
+      if (obs) obs.disconnect();
+      return resolve('timeout');
+    }
     setTimeout(check, 100);
   })();
 })
 "@
     Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+
     if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
 }
 
@@ -325,6 +368,14 @@ function Invoke-Capture {
     $vpHeight = if ($Cfg.viewport.height) { [int]$Cfg.viewport.height } else { 800 }
     $vpScale  = if ($Cfg.viewport.device_scale_factor) { [double]$Cfg.viewport.device_scale_factor } else { 1 }
 
+    # 待機設定（ローディング中の画面を撮らないため）
+    #   stable_ms      : DOMがこの時間変化しなくなったら「描画完了」とみなす
+    #   load_timeout_ms: 上記を待つ最大時間（超えたら諦めて撮影）
+    #   ready_selector : 指定するとこの要素が表示されるまで待つ（最も確実）
+    $script:StableMs      = if ($null -ne $Cfg.stable_ms) { [int]$Cfg.stable_ms } else { 1000 }
+    $script:LoadTimeoutMs = if ($null -ne $Cfg.load_timeout_ms) { [int]$Cfg.load_timeout_ms } else { 30000 }
+    $script:ReadySelector = if ($Cfg.ready_selector) { [string]$Cfg.ready_selector } else { "" }
+
     if (-not (Test-Path $outputDir)) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     }
@@ -443,6 +494,10 @@ function Save-RecordedConfig {
         settle_ms          = if ($null -ne $BaseCfg.settle_ms) { [int]$BaseCfg.settle_ms } else { 800 }
         pages              = @($allPages)
     }
+    # 待機設定を引き継ぐ（指定があれば）
+    if ($null -ne $BaseCfg.stable_ms)       { $out.stable_ms = [int]$BaseCfg.stable_ms }
+    if ($null -ne $BaseCfg.load_timeout_ms) { $out.load_timeout_ms = [int]$BaseCfg.load_timeout_ms }
+    if ($BaseCfg.ready_selector)            { $out.ready_selector = [string]$BaseCfg.ready_selector }
     if ($BaseCfg.viewport) { $out.viewport = $BaseCfg.viewport }
 
     $dir = Split-Path $OutPath -Parent

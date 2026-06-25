@@ -5,28 +5,26 @@
   "full_page": true,
   "wait_state": "networkidle",
   "settle_ms": 800,
-  "pages": [
-    {
-      "name": "recorded",
-      "actions": [
-        {
-          "type": "click",
-          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(3) \u003e article \u003e div \u003e a"
-        },
-        {
-          "type": "click",
-          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(12) \u003e article \u003e a"
-        },
-        {
-          "type": "click",
-          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(13) \u003e article \u003e div \u003e a"
-        }
-      ]
-    }
-  ],
+  "stable_ms": 1000,
+  "load_timeout_ms": 30000,
+  "ready_selector": "",
   "viewport": {
     "width": 1280,
     "height": 800,
     "device_scale_factor": 1
-  }
+  },
+  "pages": [
+    {
+      "name": "screen_001",
+      "actions": [
+        { "type": "goto", "url": "https://zenn.dev/" }
+      ]
+    },
+    {
+      "name": "screen_002",
+      "actions": [
+        { "type": "goto", "url": "https://zenn.dev/articles/explore" }
+      ]
+    }
+  ]
 }

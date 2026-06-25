@@ -8,6 +8,7 @@
   "stable_ms": 1000,
   "load_timeout_ms": 30000,
   "ready_selector": "",
+  "spa_mode": false,
   "viewport": {
     "width": 1280,
     "height": 800,

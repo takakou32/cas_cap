@@ -288,8 +288,28 @@ new Promise((resolve, reject) => {
             }
         }
         "goto" {
-            Invoke-CdpCommand -Ws $Ws -Method "Page.navigate" -Params @{ url = $Action.url } | Out-Null
-            Wait-PageReady -Ws $Ws -SettleMs $SettleMs
+            if ($script:SpaMode) {
+                # SPA(認証あり)向け: リロードせず history.pushState でルートだけ変更し、
+                # ロード済みアプリの認証状態を保ったまま画面遷移する（同一オリジンのみ）。
+                $u = ConvertTo-JsLiteral $Action.url
+                $expr = @"
+(function(u){
+  try {
+    var t = new URL(u, location.href);
+    if (t.origin !== location.origin) { location.href = u; return 'hard'; }
+    history.pushState({}, '', t.pathname + t.search + t.hash);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    window.dispatchEvent(new Event('hashchange'));
+    return 'soft';
+  } catch (e) { location.href = u; return 'err'; }
+})($u)
+"@
+                Invoke-PageScriptSafe -Ws $Ws -Expression $expr | Out-Null
+                Wait-PageReady -Ws $Ws -SettleMs $SettleMs
+            } else {
+                Invoke-CdpCommand -Ws $Ws -Method "Page.navigate" -Params @{ url = $Action.url } | Out-Null
+                Wait-PageReady -Ws $Ws -SettleMs $SettleMs
+            }
         }
         "select" {
             $sel = ConvertTo-JsLiteral $Action.selector
@@ -398,6 +418,9 @@ function Invoke-Capture {
     $script:LoadTimeoutMs = if ($null -ne $Cfg.load_timeout_ms) { [int]$Cfg.load_timeout_ms } else { 30000 }
     $script:ReadySelector = if ($Cfg.ready_selector) { [string]$Cfg.ready_selector } else { "" }
 
+    # SPA(Vue等)の認証付きシステム向け: goto をリロードせず pushState で行う
+    $script:SpaMode = if ($null -ne $Cfg.spa_mode) { [bool]$Cfg.spa_mode } else { $false }
+
     if (-not (Test-Path $outputDir)) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     }
@@ -464,6 +487,8 @@ $script:RecorderJs = @'
 (function(){
   if (window.__capRecInstalled) return;
   window.__capRecInstalled = true;
+  // 実ドキュメントのロード回数を数える（SPAのソフト遷移ではこの注入が走らない＝増えない）
+  try { sessionStorage.setItem("__capLoad", String((parseInt(sessionStorage.getItem("__capLoad")||"0",10))+1)); } catch(e){}
   function uniq(sel){ try { return document.querySelectorAll(sel).length === 1; } catch(e){ return false; } }
   function cssPath(el){
     if (!el || el.nodeType !== 1) return "";
@@ -498,12 +523,12 @@ $script:RecorderJs = @'
 
 # 現在のURLと、溜まった入力イベントをまとめて回収してバッファをクリアするJS
 $script:DrainJs = @'
-(function(){try{var k="__capRec";var arr=JSON.parse(localStorage.getItem(k)||"[]");localStorage.setItem(k,"[]");return JSON.stringify({url:location.href,events:arr});}catch(e){return JSON.stringify({url:"",events:[]});}})()
+(function(){try{var k="__capRec";var arr=JSON.parse(localStorage.getItem(k)||"[]");localStorage.setItem(k,"[]");var ld=0;try{ld=parseInt(sessionStorage.getItem("__capLoad")||"0",10)}catch(e){}return JSON.stringify({url:location.href,load:ld,events:arr});}catch(e){return JSON.stringify({url:"",load:0,events:[]});}})()
 '@
 
 # 記録した複数ページを、そのまま再生できる設定ファイルとして保存する（毎回上書き）
 function Save-RecordedConfig {
-    param($BaseCfg, $Pages, [string]$OutPath)
+    param($BaseCfg, $Pages, [string]$OutPath, [bool]$SpaMode = $false)
 
     $allPages = @($Pages)
 
@@ -516,6 +541,8 @@ function Save-RecordedConfig {
         settle_ms          = if ($null -ne $BaseCfg.settle_ms) { [int]$BaseCfg.settle_ms } else { 800 }
         pages              = @($allPages)
     }
+    # SPA(認証付き等)を検出していれば spa_mode を有効にして保存（再生時にリロードせず遷移）
+    if ($SpaMode -or $BaseCfg.spa_mode) { $out.spa_mode = $true }
     # 待機設定を引き継ぐ（指定があれば）
     if ($null -ne $BaseCfg.stable_ms)       { $out.stable_ms = [int]$BaseCfg.stable_ms }
     if ($null -ne $BaseCfg.load_timeout_ms) { $out.load_timeout_ms = [int]$BaseCfg.load_timeout_ms }
@@ -539,10 +566,18 @@ function Add-RecordSample {
 
     # 画面遷移の検出（直前と異なるURLになったら1画面として記録）
     if ($obj.url -and $obj.url -ne $LastUrl.Value) {
+        # SPA判定: 同一オリジンでURLが変わったのにロード回数が増えていない＝ソフト遷移
+        if ($LastUrl.Value) {
+            $sameOrigin = $false
+            try { $sameOrigin = (([Uri]$obj.url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$LastUrl.Value).GetLeftPart([System.UriPartial]::Authority)) } catch {}
+            $load = [int]$obj.load
+            if ($sameOrigin -and $load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
+        }
         [void]$Visited.Add($obj.url)
         $LastUrl.Value = $obj.url
         if ($Verbose) { Write-Host "  画面 $($Visited.Count): $($obj.url)" }
     }
+    if ($null -ne $obj.load) { $script:RecLastLoad = [int]$obj.load }
 
     # 入力(fill/select)をその画面のURLに紐付けて蓄積（同一セレクタは最後の値で上書き）
     foreach ($e in @($obj.events)) {
@@ -584,6 +619,8 @@ function Start-Recording {
     $visited    = New-Object System.Collections.ArrayList   # 遷移した順のURL（連続重複は除く）
     $fillsByUrl = @{}                                        # URL -> その画面で行った入力(fill/select)
     $lastUrl    = $null
+    $script:RecLastLoad = 0       # 直近のドキュメントロード回数
+    $script:RecSawSpa   = $false  # SPAソフト遷移を1度でも検出したか
     try {
         Invoke-CdpCommand -Ws $ws -Method "Page.enable" | Out-Null
         Invoke-CdpCommand -Ws $ws -Method "Runtime.enable" | Out-Null
@@ -646,12 +683,15 @@ function Start-Recording {
 
     Write-Host ""
     Write-Host "記録した画面数: $($pages.Count)"
+    if ($script:RecSawSpa) {
+        Write-Host "SPA(クライアントサイド遷移)を検出 → spa_mode=true で保存します（再生時はリロードせず遷移）。"
+    }
     if ($pages.Count -eq 0) {
         Write-Host "画面が記録されませんでした。保存はスキップします。"
         return
     }
 
-    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath
+    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath -SpaMode $script:RecSawSpa
     Write-Host "保存先: $OutPath"
     Write-Host "再生(全画面キャプチャ): .\powershell\cdp_capture.ps1 -Config `"$OutPath`""
 }

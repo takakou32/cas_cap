@@ -1,9 +1,32 @@
 {
   "cdp_url": "http://localhost:9222",
-  "target_url_keyword": "your-app-url",
+  "target_url_keyword": "https://zenn.dev/",
   "output_dir": "output",
   "full_page": true,
   "wait_state": "networkidle",
   "settle_ms": 800,
-  "pages": []
+  "pages": [
+    {
+      "name": "recorded",
+      "actions": [
+        {
+          "type": "click",
+          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(3) \u003e article \u003e div \u003e a"
+        },
+        {
+          "type": "click",
+          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(12) \u003e article \u003e a"
+        },
+        {
+          "type": "click",
+          "selector": "#tech-trend \u003e div \u003e div:nth-of-type(2) \u003e div:nth-of-type(13) \u003e article \u003e div \u003e a"
+        }
+      ]
+    }
+  ],
+  "viewport": {
+    "width": 1280,
+    "height": 800,
+    "device_scale_factor": 1
+  }
 }

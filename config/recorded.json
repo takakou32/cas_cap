@@ -1,0 +1,105 @@
+{
+    "cdp_url":  "http://localhost:9222",
+    "target_url_keyword":  "https://zenn.dev",
+    "output_dir":  "output",
+    "full_page":  true,
+    "wait_state":  "networkidle",
+    "settle_ms":  800,
+    "pages":  [
+                  {
+                      "name":  "recorded_001",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_002",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/higakijin/articles/06276828c81546"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_003",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_004",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/nomhiro/articles/poc-develop-use-github-copilot-app"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_005",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_006",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/ncdc/articles/bb8ffdd1a874ea"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_007",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_008",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/articles/explore#ideas"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_009",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/safubuki/articles/turtle-20250502-gem"
+                                      }
+                                  ]
+                  },
+                  {
+                      "name":  "recorded_010",
+                      "actions":  [
+                                      {
+                                          "type":  "goto",
+                                          "url":  "https://zenn.dev/articles/explore#ideas"
+                                      }
+                                  ]
+                  }
+              ],
+    "viewport":  {
+                     "width":  1280,
+                     "height":  800,
+                     "device_scale_factor":  1
+                 }
+}

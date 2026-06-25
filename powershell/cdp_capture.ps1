@@ -569,24 +569,58 @@ $script:RecorderJs = @'
   // 実ドキュメントのロード回数を数える（SPAのソフト遷移ではこの注入が走らない＝増えない）
   try { sessionStorage.setItem("__capLoad", String((parseInt(sessionStorage.getItem("__capLoad")||"0",10))+1)); } catch(e){}
   function uniq(sel){ try { return document.querySelectorAll(sel).length === 1; } catch(e){ return false; } }
-  function cssPath(el){
-    if (!el || el.nodeType !== 1) return "";
-    if (el.id && uniq("#"+CSS.escape(el.id))) return "#"+CSS.escape(el.id);
-    var attrs = ["data-testid","name","aria-label","placeholder"];
+  // 自動生成され毎回変わるID（PrimeVueのpv_id_、ReactのuseId、各UIライブラリ等）は使わない
+  function volatileId(id){
+    return !id
+      || /^pv_id_/.test(id)
+      || /^:r[0-9a-z]+:?$/i.test(id)
+      || /^(headlessui|radix|mui|el-id|ember|svelte|aria-)/i.test(id)
+      || /[0-9]{4,}/.test(id)
+      || /_[0-9]+(_|$)/.test(id);
+  }
+  // ハッシュ的・状態的でない安定したクラスだけ残す
+  function stableClasses(el){
+    if (!el.classList) return [];
+    return Array.prototype.slice.call(el.classList).filter(function(c){
+      return c && c.length>1
+        && !/[0-9]{3,}/.test(c)
+        && !/^(ng-|v-|jsx-|css-|sc-|is-|has-|active|selected|open|show|hover|focus)/.test(c)
+        && !/--[0-9a-f]{4,}/.test(c)
+        && !/[0-9a-f]{6,}/.test(c);
+    });
+  }
+  function attrSel(el){
+    var tag=el.tagName.toLowerCase();
+    var attrs=["data-pc-section","data-pc-name","data-testid","data-test","data-cy","name","aria-label","title","role","placeholder"];
     for (var i=0;i<attrs.length;i++){
       var a=attrs[i]; var v=el.getAttribute && el.getAttribute(a);
-      if(v){ var s=el.tagName.toLowerCase()+"["+a+"=\""+v.replace(/"/g,'\\"')+"\"]"; if(uniq(s)) return s; }
+      if(v){ var s=tag+"["+a+"=\""+(""+v).replace(/"/g,'\\"')+"\"]"; if(uniq(s)) return s; }
     }
-    var parts=[]; var node=el;
-    while(node && node.nodeType===1 && node!==document.body && node!==document.documentElement){
-      if(node.id){ parts.unshift("#"+CSS.escape(node.id)); break; }
-      var part=node.tagName.toLowerCase();
+    return null;
+  }
+  function cssPath(el){
+    if (!el || el.nodeType !== 1) return "";
+    if (el.id && !volatileId(el.id) && uniq("#"+CSS.escape(el.id))) return "#"+CSS.escape(el.id);
+    var sa=attrSel(el); if(sa) return sa;
+    var parts=[]; var node=el; var depth=0;
+    while(node && node.nodeType===1 && node!==document.body && node!==document.documentElement && depth<12){
+      if(node.id && !volatileId(node.id)){ parts.unshift("#"+CSS.escape(node.id)); break; }
+      var seg=node.tagName.toLowerCase();
+      var cls=stableClasses(node);
+      if(cls.length){ seg += "."+cls.map(function(c){ return CSS.escape(c); }).join("."); }
       var parent=node.parentNode;
       if(parent){
-        var same=[]; for(var j=0;j<parent.children.length;j++){ if(parent.children[j].tagName===node.tagName) same.push(parent.children[j]); }
-        if(same.length>1){ part+=":nth-of-type("+(same.indexOf(node)+1)+")"; }
+        var sibs=Array.prototype.slice.call(parent.children).filter(function(c){
+          if(c.tagName!==node.tagName) return false;
+          if(!cls.length) return true;
+          return cls.every(function(k){ return c.classList && c.classList.contains(k); });
+        });
+        if(sibs.length>1){ seg += ":nth-of-type("+(Array.prototype.indexOf.call(parent.children,node)+1)+")"; }
       }
-      parts.unshift(part); node=parent;
+      parts.unshift(seg);
+      var cand=parts.join(" > ");
+      try { if(document.querySelectorAll(cand).length===1) return cand; } catch(e){}
+      node=parent; depth++;
     }
     return parts.join(" > ");
   }

@@ -250,7 +250,7 @@ new Promise((resolve) => {
   function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
   function byText(){
     if (!text) return null;
-    var list = Array.prototype.slice.call(document.querySelectorAll('a,button,[role=button],[role=tab],[role=menuitem],[role=link],[tabindex],[onclick]')).filter(visible);
+    var list = Array.prototype.slice.call(document.querySelectorAll('a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[tabindex],[onclick]')).filter(visible);
     return list.find(function(e){ return (e.innerText||e.textContent||'').trim() === text; })
         || list.find(function(e){ return (e.innerText||e.textContent||'').trim().indexOf(text) >= 0; });
   }
@@ -564,10 +564,10 @@ function Invoke-Capture {
 # 画面遷移そのものはPS側がURL変化を監視して検出し、goto アクションとして再現する。
 $script:RecorderJs = @'
 (function(){
-  if (window.__capRecInstalled) return;
-  window.__capRecInstalled = true;
-  // 実ドキュメントのロード回数を数える（SPAのソフト遷移ではこの注入が走らない＝増えない）
-  try { sessionStorage.setItem("__capLoad", String((parseInt(sessionStorage.getItem("__capLoad")||"0",10))+1)); } catch(e){}
+  // 1ドキュメントにつき1回だけロード回数を加算（SPAソフト遷移では新ドキュメントにならない＝増えない）
+  if (!window.__capLoadCounted){ window.__capLoadCounted = true;
+    try { sessionStorage.setItem("__capLoad", String((parseInt(sessionStorage.getItem("__capLoad")||"0",10))+1)); } catch(e){}
+  }
   function uniq(sel){ try { return document.querySelectorAll(sel).length === 1; } catch(e){ return false; } }
   // 自動生成され毎回変わるID（PrimeVueのpv_id_、ReactのuseId、各UIライブラリ等）は使わない
   function volatileId(id){
@@ -625,10 +625,11 @@ $script:RecorderJs = @'
     return parts.join(" > ");
   }
   function push(ev){ try{ ev.url=location.href; var k="__capRec"; var arr=JSON.parse(localStorage.getItem(k)||"[]"); arr.push(ev); localStorage.setItem(k,JSON.stringify(arr)); }catch(e){} }
-  // クリックを記録（ページ内タブ切替・ボタン・リンク等）。
-  // 標準的なクリック対象が無ければ cursor:pointer の要素でカスタムタブも拾う。
-  document.addEventListener("click", function(e){
-    var t=e.target.closest("a,button,[role=button],[role=tab],[role=menuitem],[role=link],[onclick],[tabindex]");
+
+  // クリックを記録（タブ切替・ボタン・リンク・サジェスト候補等）。
+  // 標準的なクリック対象が無ければ cursor:pointer の要素でカスタムUIも拾う。
+  var clickH = function(e){
+    var t=e.target.closest("a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[onclick],[tabindex]");
     if(!t){
       var el=e.target;
       if(el && el!==document.body && el!==document.documentElement){
@@ -644,13 +645,22 @@ $script:RecorderJs = @'
     }
     var label=((t.innerText||t.textContent||"").trim()).slice(0,80);
     push({type:"click", selector:cssPath(t), text:label});
-  }, true);
-  document.addEventListener("change", function(e){
+  };
+  var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
     if(tag==="select"){ push({type:"select", selector:cssPath(el), value:el.value}); }
     else if(el.type==="checkbox"||el.type==="radio"){ /* クリックで記録済み */ }
     else if(tag==="input"||tag==="textarea"){ push({type:"fill", selector:cssPath(el), value:el.value}); }
-  }, true);
+  };
+
+  // 古いハンドラがあれば除去して最新を付け直す。
+  // これにより「ページを開いたまま録り直し」ても古いcssPath実装が残らない。
+  try { if(window.__capClickH)  document.removeEventListener("click",  window.__capClickH,  true); } catch(e){}
+  try { if(window.__capChangeH) document.removeEventListener("change", window.__capChangeH, true); } catch(e){}
+  window.__capClickH = clickH;
+  window.__capChangeH = changeH;
+  document.addEventListener("click",  clickH,  true);
+  document.addEventListener("change", changeH, true);
 })();
 '@
 

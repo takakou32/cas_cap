@@ -363,20 +363,55 @@ function Set-Viewport {
 # ---------------------------------------------------------------------------
 # スクリーンショット
 # ---------------------------------------------------------------------------
+# 本文の実スクロール高さ（内側スクロール領域も考慮）をCSSピクセルで測る。
+# SPA(html,body=overflow:hidden + 内側divがスクロール)でも全高さを取得できる。
+$script:MeasureHeightJs = @'
+(function(){
+  var d=document.documentElement, b=document.body;
+  var max=Math.max(d.scrollHeight||0, d.clientHeight||0, d.offsetHeight||0,
+                   b?b.scrollHeight:0, b?b.offsetHeight:0);
+  var els = b ? b.getElementsByTagName('*') : [];
+  for (var i=0;i<els.length;i++){
+    var e=els[i];
+    if (e.scrollHeight > max && e.scrollHeight > e.clientHeight + 1){
+      var ov=''; try { ov=getComputedStyle(e).overflowY; } catch(_){}
+      if (ov==='auto' || ov==='scroll'){ max=e.scrollHeight; }
+    }
+  }
+  return Math.ceil(max);
+})()
+'@
+
 function Save-Screenshot {
     param($Ws, [string]$Path, [bool]$FullPage)
 
     $params = @{ format = "png" }
     if ($FullPage) {
-        $metrics = Invoke-CdpCommand -Ws $Ws -Method "Page.getLayoutMetrics"
-        $size = if ($metrics.cssContentSize) { $metrics.cssContentSize } else { $metrics.contentSize }
-        $w = [Math]::Ceiling([double]$size.width)
-        $h = [Math]::Ceiling([double]$size.height)
+        $cap = 16384   # Chromiumのスクショ高さ上限の目安
+        # 実コンテンツ高さを測り、その高さまでビューポートを広げてレイアウトを展開させる
+        $full = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
+        if ($full -lt 1) { $full = $script:VpHeight }
+        if ($full -gt $cap) { $full = $cap }
+        Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full -Scale $script:VpScale
+        Start-Sleep -Milliseconds 400
+        # 遅延ロードで伸びる場合に備えて再測定し、必要なら更に広げる
+        $full2 = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
+        if ($full2 -gt $cap) { $full2 = $cap }
+        if ($full2 -gt $full) {
+            Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full2 -Scale $script:VpScale
+            Start-Sleep -Milliseconds 400
+            $full = $full2
+        }
         $params.captureBeyondViewport = $true
-        $params.clip = @{ x = 0; y = 0; width = $w; height = $h; scale = 1 }
+        $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $full; scale = 1 }
     }
     $result = Invoke-CdpCommand -Ws $Ws -Method "Page.captureScreenshot" -Params $params
     [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String($result.data))
+
+    if ($FullPage) {
+        # ビューポートを元のサイズに戻す
+        Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $script:VpHeight -Scale $script:VpScale
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -409,6 +444,10 @@ function Invoke-Capture {
     $vpWidth  = if ($Cfg.viewport.width)  { [int]$Cfg.viewport.width }  else { 1280 }
     $vpHeight = if ($Cfg.viewport.height) { [int]$Cfg.viewport.height } else { 800 }
     $vpScale  = if ($Cfg.viewport.device_scale_factor) { [double]$Cfg.viewport.device_scale_factor } else { 1 }
+    # Save-Screenshot がフルページ撮影時にビューポートを一時的に広げる際に参照する
+    $script:VpWidth  = $vpWidth
+    $script:VpHeight = $vpHeight
+    $script:VpScale  = $vpScale
 
     # 待機設定（ローディング中の画面を撮らないため）
     #   stable_ms      : DOMがこの時間変化しなくなったら「描画完了」とみなす

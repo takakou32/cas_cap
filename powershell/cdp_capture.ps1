@@ -240,33 +240,56 @@ function Invoke-CapAction {
 
     switch ($Action.type) {
         "click" {
+            # セレクタで待機 → 見つからなければ記録時のテキストで一致検索 → それでも無ければスキップ
             $sel = ConvertTo-JsLiteral $Action.selector
+            $txt = ConvertTo-JsLiteral ([string]$Action.text)
+            $to  = $script:ActionTimeoutMs
             $expr = @"
-new Promise((resolve, reject) => {
-  const el = document.querySelector($sel);
-  if (!el) return reject(new Error('要素が見つかりません: ' + $sel));
-  el.scrollIntoView({block:'center'});
-  el.click();
-  resolve(true);
+new Promise((resolve) => {
+  const sel = $sel, text = $txt, deadline = Date.now() + $to;
+  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  function byText(){
+    if (!text) return null;
+    var list = Array.prototype.slice.call(document.querySelectorAll('a,button,[role=button],[role=tab],[role=menuitem],[role=link],[tabindex],[onclick]')).filter(visible);
+    return list.find(function(e){ return (e.innerText||e.textContent||'').trim() === text; })
+        || list.find(function(e){ return (e.innerText||e.textContent||'').trim().indexOf(text) >= 0; });
+  }
+  (function check(){
+    var el = null; try { el = document.querySelector(sel); } catch(e){}
+    if (visible(el)) { el.scrollIntoView({block:'center'}); el.click(); return resolve('clicked'); }
+    var c = byText();
+    if (c) { c.scrollIntoView({block:'center'}); c.click(); return resolve('text'); }
+    if (Date.now() > deadline) return resolve('notfound');
+    setTimeout(check, 150);
+  })();
 })
 "@
-            Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+            $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
+            if ($st -eq 'notfound') { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
+            elseif ($st -eq 'text') { Write-Host "  (テキスト一致でクリック: $($Action.text))" }
         }
         "fill" {
             $sel = ConvertTo-JsLiteral $Action.selector
             $val = ConvertTo-JsLiteral $Action.value
+            $to  = $script:ActionTimeoutMs
             $expr = @"
-new Promise((resolve, reject) => {
-  const el = document.querySelector($sel);
-  if (!el) return reject(new Error('要素が見つかりません: ' + $sel));
-  el.focus();
-  el.value = $val;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  resolve(true);
+new Promise((resolve) => {
+  const sel = $sel, val = $val, deadline = Date.now() + $to;
+  (function check(){
+    var el = null; try { el = document.querySelector(sel); } catch(e){}
+    if (el) {
+      el.focus(); el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return resolve('ok');
+    }
+    if (Date.now() > deadline) return resolve('notfound');
+    setTimeout(check, 150);
+  })();
 })
 "@
-            Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+            $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
+            if ($st -eq 'notfound') { Write-Warning "入力対象が見つかりません(スキップ): $($Action.selector)" }
         }
         "wait" {
             $timeout = if ($Action.timeout) { [int]$Action.timeout } else { 5000 }
@@ -314,17 +337,25 @@ new Promise((resolve, reject) => {
         "select" {
             $sel = ConvertTo-JsLiteral $Action.selector
             $val = ConvertTo-JsLiteral $Action.value
+            $to  = $script:ActionTimeoutMs
             $expr = @"
-new Promise((resolve, reject) => {
-  const el = document.querySelector($sel);
-  if (!el) return reject(new Error('要素が見つかりません: ' + $sel));
-  el.value = $val;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  resolve(true);
+new Promise((resolve) => {
+  const sel = $sel, val = $val, deadline = Date.now() + $to;
+  (function check(){
+    var el = null; try { el = document.querySelector(sel); } catch(e){}
+    if (el) {
+      el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return resolve('ok');
+    }
+    if (Date.now() > deadline) return resolve('notfound');
+    setTimeout(check, 150);
+  })();
 })
 "@
-            Invoke-PageScript -Ws $Ws -Expression $expr -AwaitPromise $true | Out-Null
+            $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
+            if ($st -eq 'notfound') { Write-Warning "選択対象が見つかりません(スキップ): $($Action.selector)" }
         }
         "keyboard" {
             $key = ConvertTo-JsLiteral $Action.key
@@ -456,6 +487,8 @@ function Invoke-Capture {
     $script:StableMs      = if ($null -ne $Cfg.stable_ms) { [int]$Cfg.stable_ms } else { 1000 }
     $script:LoadTimeoutMs = if ($null -ne $Cfg.load_timeout_ms) { [int]$Cfg.load_timeout_ms } else { 30000 }
     $script:ReadySelector = if ($Cfg.ready_selector) { [string]$Cfg.ready_selector } else { "" }
+    # 要素クリック/入力で対象を待つ最大時間（超えたらスキップして継続）
+    $script:ActionTimeoutMs = if ($null -ne $Cfg.action_timeout_ms) { [int]$Cfg.action_timeout_ms } else { 5000 }
 
     # SPA(Vue等)の認証付きシステム向け: goto をリロードせず pushState で行う
     $script:SpaMode = if ($null -ne $Cfg.spa_mode) { [bool]$Cfg.spa_mode } else { $false }
@@ -490,21 +523,28 @@ function Invoke-Capture {
             Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
             Write-Host "キャプチャ保存: $filename"
         } else {
-            # 複数画面を巡回キャプチャ
+            # 複数画面を巡回キャプチャ（1ページの失敗で全体を止めない）
             for ($i = 0; $i -lt $pagesCfg.Count; $i++) {
                 $pageConf = $pagesCfg[$i]
                 $name = if ($pageConf.name) { $pageConf.name } else { "page_{0:D3}" -f $i }
                 $actions = if ($pageConf.actions) { @($pageConf.actions) } else { @() }
 
-                foreach ($action in $actions) {
-                    Invoke-CapAction -Ws $ws -Action $action -SettleMs $settleMs
+                try {
+                    foreach ($action in $actions) {
+                        Invoke-CapAction -Ws $ws -Action $action -SettleMs $settleMs
+                    }
+                    Wait-PageReady -Ws $ws -SettleMs $settleMs
+                } catch {
+                    Write-Warning "ページ '$name' の操作中にエラー(撮影は継続): $_"
                 }
 
-                Wait-PageReady -Ws $ws -SettleMs $settleMs
-
                 $filename = Join-Path $outputDir "${ts}_${name}.png"
-                Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
-                Write-Host "キャプチャ保存: $filename"
+                try {
+                    Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
+                    Write-Host "キャプチャ保存: $filename"
+                } catch {
+                    Write-Warning "ページ '$name' の撮影に失敗(スキップ): $_"
+                }
             }
         }
     } finally {
@@ -568,7 +608,8 @@ $script:RecorderJs = @'
       var ty=(t.type||"").toLowerCase();
       if(ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio") return; // テキスト入力はfillで扱う
     }
-    push({type:"click", selector:cssPath(t)});
+    var label=((t.innerText||t.textContent||"").trim()).slice(0,80);
+    push({type:"click", selector:cssPath(t), text:label});
   }, true);
   document.addEventListener("change", function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
@@ -648,8 +689,11 @@ function Add-RecordSample {
     # 1) イベント(クリック/入力)を発生順に処理
     foreach ($e in @($obj.events)) {
         if ($e.type -eq "click") {
-            # クリックは1撮影ポイント（ページ内タブ切替・遷移リンク等）
-            Add-RecPage -Action ([ordered]@{ type = "click"; selector = $e.selector }) -Verbose $Verbose
+            # クリックは1撮影ポイント（ページ内タブ切替・遷移リンク等）。
+            # 記録時のラベル文字列も保存し、再生時にセレクタが外れたらテキスト一致で探す。
+            $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
+            if ($e.text) { $clickAct.text = [string]$e.text }
+            Add-RecPage -Action $clickAct -Verbose $Verbose
             $script:RecLastWasClick = $true
         }
         elseif ($e.type -eq "fill" -or $e.type -eq "select") {

@@ -432,6 +432,19 @@ $script:ModalCheckJs = @'
       if(r.width>40 && r.height>40) return true;
     }
   }
+  // 汎用: ビューポートの大部分を覆う高z-indexの position:fixed 要素（未知ライブラリの拡大表示/モーダル対策）
+  var vw=window.innerWidth, vh=window.innerHeight, area=vw*vh;
+  var all = document.body ? document.body.getElementsByTagName('*') : [];
+  for (var k=0;k<all.length;k++){
+    var x=all[k], cs;
+    try { cs=getComputedStyle(x); } catch(_){ continue; }
+    if (cs.position!=='fixed') continue;
+    if (cs.visibility==='hidden' || cs.display==='none' || parseFloat(cs.opacity||'1')<0.1) continue;
+    var z=parseInt(cs.zIndex,10); if(isNaN(z)) z=0;
+    if (z < 100) continue;
+    var rr=x.getBoundingClientRect();
+    if (rr.width*rr.height > area*0.5 && rr.width > vw*0.5 && rr.height > vh*0.4) return true;
+  }
   return false;
 })()
 '@

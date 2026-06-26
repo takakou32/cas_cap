@@ -413,34 +413,68 @@ $script:MeasureHeightJs = @'
 })()
 '@
 
+# 表示中のモーダル/ポップアップ(position:fixed のダイアログ等)を検出する。
+# これがある時は縦拡張するとfixed要素が崩れるため、ビューポートのまま撮る。
+$script:ModalCheckJs = @'
+(function(){
+  var sels=['[role=dialog]','[aria-modal="true"]','.p-dialog','.p-dialog-mask',
+            '.p-overlaypanel','.p-sidebar','.p-drawer','.p-confirmdialog',
+            '.modal.show','.modal.in','.el-overlay','.el-dialog__wrapper',
+            '.ant-modal-root','.ant-modal-wrap','.v-overlay--active','.MuiModal-root',
+            '.cdk-overlay-pane'];
+  for (var i=0;i<sels.length;i++){
+    var nodes; try { nodes=document.querySelectorAll(sels[i]); } catch(e){ continue; }
+    for (var j=0;j<nodes.length;j++){
+      var el=nodes[j];
+      var vis = el && (el.offsetParent!==null || (el.getClientRects && el.getClientRects().length>0));
+      if(!vis) continue;
+      var r=el.getBoundingClientRect();
+      if(r.width>40 && r.height>40) return true;
+    }
+  }
+  return false;
+})()
+'@
+
 function Save-Screenshot {
     param($Ws, [string]$Path, [bool]$FullPage)
 
     $params = @{ format = "png" }
+    $expanded = $false
     if ($FullPage) {
-        $cap = 16384   # Chromiumのスクショ高さ上限の目安
-        # 実コンテンツ高さを測り、その高さまでビューポートを広げてレイアウトを展開させる
-        $full = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
-        if ($full -lt 1) { $full = $script:VpHeight }
-        if ($full -gt $cap) { $full = $cap }
-        Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full -Scale $script:VpScale
-        Start-Sleep -Milliseconds 400
-        # 遅延ロードで伸びる場合に備えて再測定し、必要なら更に広げる
-        $full2 = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
-        if ($full2 -gt $cap) { $full2 = $cap }
-        if ($full2 -gt $full) {
-            Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full2 -Scale $script:VpScale
+        $modal = $false
+        try { $modal = [bool](Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalCheckJs) } catch {}
+        if ($modal) {
+            # ポップアップ/モーダル表示中はビューポートのまま撮影（縦拡張するとfixed要素が崩れる）
+            Write-Host "  (モーダル検出: ビューポートで撮影)"
+            $params.captureBeyondViewport = $false
+            $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $script:VpHeight; scale = 1 }
+        } else {
+            $cap = 16384   # Chromiumのスクショ高さ上限の目安
+            # 実コンテンツ高さを測り、その高さまでビューポートを広げてレイアウトを展開させる
+            $full = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
+            if ($full -lt 1) { $full = $script:VpHeight }
+            if ($full -gt $cap) { $full = $cap }
+            Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full -Scale $script:VpScale
+            $expanded = $true
             Start-Sleep -Milliseconds 400
-            $full = $full2
+            # 遅延ロードで伸びる場合に備えて再測定し、必要なら更に広げる
+            $full2 = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
+            if ($full2 -gt $cap) { $full2 = $cap }
+            if ($full2 -gt $full) {
+                Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full2 -Scale $script:VpScale
+                Start-Sleep -Milliseconds 400
+                $full = $full2
+            }
+            $params.captureBeyondViewport = $true
+            $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $full; scale = 1 }
         }
-        $params.captureBeyondViewport = $true
-        $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $full; scale = 1 }
     }
     $result = Invoke-CdpCommand -Ws $Ws -Method "Page.captureScreenshot" -Params $params
     [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String($result.data))
 
-    if ($FullPage) {
-        # ビューポートを元のサイズに戻す
+    if ($expanded) {
+        # 広げたビューポートを元のサイズに戻す
         Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $script:VpHeight -Scale $script:VpScale
     }
 }

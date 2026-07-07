@@ -482,13 +482,17 @@ $script:ModalPrepareJs = @'
   set(dlg,'position','fixed'); set(dlg,'left','0px'); set(dlg,'top','0px');
   set(dlg,'right','auto'); set(dlg,'bottom','auto'); set(dlg,'margin','0px');
   set(dlg,'transform','none'); set(dlg,'max-width','none'); set(dlg,'max-height','none'); set(dlg,'overflow','visible');
-  // 5) 内部の横/縦スクロール領域を展開
+  // 5) 内部要素のクリップ(overflow)を一時解除。中間コンテナ(.p-dialog-content等)が
+  //    overflow:hidden/固定幅ではみ出しを切ってしまうのを防ぐ。
+  //    スクロール中の要素はサイズ制約(max-width/height)も解除して全内容を展開する。
   var inner=dlg.getElementsByTagName('*');
   for (var m=0;m<inner.length;m++){
     var y=inner[m];
-    if(y.scrollWidth>y.clientWidth+1 || y.scrollHeight>y.clientHeight+1){
-      set(y,'overflow','visible'); set(y,'max-width','none'); set(y,'max-height','none');
-    }
+    var scrollable = (y.scrollWidth>y.clientWidth+1 || y.scrollHeight>y.clientHeight+1);
+    var ycs=null; try{ ycs=getComputedStyle(y); }catch(_){}
+    var clips = ycs && (ycs.overflowX!=='visible' || ycs.overflowY!=='visible');
+    if(scrollable){ set(y,'overflow','visible'); set(y,'max-width','none'); set(y,'max-height','none'); }
+    else if(clips){ set(y,'overflow','visible'); }
   }
   dlg.setAttribute('data-capmodal','1');
   window.__capModalRestore=changed;

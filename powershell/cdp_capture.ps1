@@ -693,26 +693,48 @@ $script:RecorderJs = @'
   }
   function push(ev){ try{ ev.url=location.href; var k="__capRec"; var arr=JSON.parse(localStorage.getItem(k)||"[]"); arr.push(ev); localStorage.setItem(k,JSON.stringify(arr)); }catch(e){} }
 
-  // クリックを記録（タブ切替・ボタン・リンク・サジェスト候補等）。
-  // 標準的なクリック対象が無ければ cursor:pointer の要素でカスタムUIも拾う。
-  var clickH = function(e){
-    var t=e.target.closest("a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[onclick],[tabindex]");
-    if(!t){
-      var el=e.target;
-      if(el && el!==document.body && el!==document.documentElement){
-        var cur=""; try{ cur=getComputedStyle(el).cursor; }catch(_){}
-        if(cur==="pointer"){ t=el; }
-      }
+  // クリック対象を決める。標準的な要素が無ければ、クリック地点から数階層さかのぼって
+  // 「クリック可能そうな祖先(cursor:pointer / role / aria-label / onclick / tabindex)」を探し、
+  // それも無ければ アイコン要素(svg/i/icon系class)そのものを対象にする（虫眼鏡等のアイコンボタン対策）。
+  function clickTarget(t0){
+    if(!t0 || t0===document.body || t0===document.documentElement) return null;
+    var t=t0.closest("a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[onclick],[tabindex]");
+    if(t) return t;
+    var el=t0, hops=0;
+    while(el && el!==document.body && el!==document.documentElement && hops<5){
+      var cur=""; try{ cur=getComputedStyle(el).cursor; }catch(_){}
+      if(cur==="pointer") return el;
+      if(el.getAttribute && (el.getAttribute("role")||el.getAttribute("aria-label")||el.getAttribute("onclick")||el.hasAttribute("tabindex"))) return el;
+      el=el.parentElement; hops++;
     }
+    var tag=(t0.tagName||"").toLowerCase();
+    var cls=(t0.getAttribute && (t0.getAttribute("class")||"")) || "";
+    if(tag==="svg"||tag==="i"||tag==="use"||/icon|search|magnif|glass/i.test(cls)){
+      return t0.closest("button,a,[role],[onclick],[tabindex],span,i,svg") || t0;
+    }
+    return null;
+  }
+  // ラベル文字列（テキスト → 自身/祖先の aria-label / title）
+  function labelOf(t){
+    var s=(t.innerText||t.textContent||"").trim();
+    if(s) return s.slice(0,80);
+    var el=t, hops=0;
+    while(el && hops<3){
+      var v = el.getAttribute && (el.getAttribute("aria-label")||el.getAttribute("title"));
+      if(v) return (""+v).trim().slice(0,80);
+      el=el.parentElement; hops++;
+    }
+    return "";
+  }
+  var clickH = function(e){
+    var t=clickTarget(e.target);
     if(!t) return;
     var tg=(t.tagName||"").toLowerCase();
     if(tg==="input"||tg==="textarea"){
       var ty=(t.type||"").toLowerCase();
       if(ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio") return; // テキスト入力はfillで扱う
     }
-    var label=(t.innerText||t.textContent||"").trim();
-    if(!label){ label=((t.getAttribute&&(t.getAttribute("aria-label")||t.getAttribute("title")))||"").trim(); }
-    push({type:"click", selector:cssPath(t), text:label.slice(0,80)});
+    push({type:"click", selector:cssPath(t), text:labelOf(t)});
   };
   var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();

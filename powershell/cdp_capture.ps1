@@ -433,6 +433,69 @@ $script:MeasureHeightJs = @'
 })()
 '@
 
+# 同一オリジンの iframe を中身の実サイズまで一時的に拡大する（埋め込み帳票プレビュー等の見切れ対策）。
+# 祖先のクリップ(overflow)も解除して、大きくなった iframe が切られないようにする。
+# 戻り値: {resized:bool, cross:bool(クロスオリジンで展開不可のiframeがあったか)}
+$script:PrepareIframesJs = @'
+(function(){
+  var changed=[], cross=false, resized=false;
+  function set(el,prop,val){ changed.push([el,prop,el.style.getPropertyValue(prop),el.style.getPropertyPriority(prop)]); el.style.setProperty(prop,val,'important'); }
+  var frames=document.getElementsByTagName('iframe');
+  for(var i=0;i<frames.length;i++){
+    var f=frames[i], r=f.getBoundingClientRect();
+    if(r.width<2 && r.height<2) continue;
+    var doc=null; try{ doc=f.contentDocument || (f.contentWindow && f.contentWindow.document); }catch(e){ doc=null; }
+    if(!doc || !doc.documentElement){ cross=true; continue; }
+    var de=doc.documentElement, bd=doc.body;
+    var iw=Math.max(de.scrollWidth||0, bd?bd.scrollWidth:0);
+    var ih=Math.max(de.scrollHeight||0, bd?bd.scrollHeight:0);
+    if(iw<=r.width+1 && ih<=r.height+1) continue;
+    resized=true;
+    set(f,'flex','none'); set(f,'min-width','0px'); set(f,'min-height','0px');
+    set(f,'max-width','none'); set(f,'max-height','none');
+    if(iw>0) set(f,'width', iw+'px');
+    if(ih>0) set(f,'height', ih+'px');
+    var anc=f.parentElement;
+    while(anc && anc!==document.documentElement){
+      var acs=null; try{ acs=getComputedStyle(anc); }catch(_){}
+      if(acs && (acs.overflowX!=='visible' || acs.overflowY!=='visible')) set(anc,'overflow','visible');
+      set(anc,'max-width','none'); set(anc,'max-height','none');
+      anc=anc.parentElement;
+    }
+  }
+  window.__capIframeRestore=changed;
+  return JSON.stringify({resized:resized, cross:cross});
+})()
+'@
+
+# PrepareIframesJs で変更したスタイルを元に戻す
+$script:IframeRestoreJs = @'
+(function(){ try{ var c=window.__capIframeRestore||[]; for(var i=0;i<c.length;i++){ var it=c[i]; if(it[2]) it[0].style.setProperty(it[1],it[2],it[3]||''); else it[0].style.removeProperty(it[1]); } window.__capIframeRestore=null; }catch(e){} return true; })()
+'@
+
+# ページ全体の必要サイズ "w,h" を測る。document のスクロールサイズに加え、
+# iframe（拡大後の実サイズ）と縦スクロール領域(overflowY:auto/scroll)を考慮する。
+$script:MeasureSizeJs = @'
+(function(){
+  var d=document.documentElement, b=document.body;
+  var w=Math.max(d.scrollWidth||0, b?b.scrollWidth:0, d.clientWidth||0);
+  var h=Math.max(d.scrollHeight||0, b?b.scrollHeight:0, d.clientHeight||0);
+  var sx=window.scrollX||d.scrollLeft||0, sy=window.scrollY||d.scrollTop||0;
+  var els=b?b.getElementsByTagName('*'):[];
+  for(var i=0;i<els.length;i++){
+    var e=els[i], tag=(e.tagName||'').toLowerCase(), r=e.getBoundingClientRect();
+    if(tag==='iframe'){
+      var right=r.left+sx+(e.offsetWidth||r.width), bottom=r.top+sy+(e.offsetHeight||r.height);
+      if(right>w) w=right; if(bottom>h) h=bottom;
+    } else if(e.scrollHeight>e.clientHeight+1){
+      var ov=''; try{ ov=getComputedStyle(e).overflowY; }catch(_){}
+      if(ov==='auto'||ov==='scroll'){ var bb=r.top+sy+e.scrollHeight; if(bb>h) h=bb; }
+    }
+  }
+  return Math.ceil(w)+","+Math.ceil(h);
+})()
+'@
+
 # 表示中のモーダル/ポップアップを検出し、全体を撮れるよう一時的に整える。
 #   - ダイアログを左上(0,0)へ固定し、サイズ制約(max-width/height)を解除
 #   - 内部の横/縦スクロール領域の overflow を visible にして全内容を展開
@@ -522,6 +585,7 @@ function Save-Screenshot {
     $params = @{ format = "png" }
     $expanded = $false
     $modalPrepared = $false
+    $iframePrepared = $false
     if ($FullPage) {
         $cap = 16384   # Chromiumのスクショ上限の目安
         $mi = $null
@@ -552,23 +616,39 @@ function Save-Screenshot {
             $params.captureBeyondViewport = $true
             $params.clip = @{ x = 0; y = 0; width = $mw; height = $mh; scale = 1 }
         } else {
-            # 通常ページ: 実コンテンツ高さを測り、その高さまでビューポートを広げて縦長で撮る
-            $full = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
+            # 通常ページ: 同一originのiframe(帳票プレビュー等)を内容サイズに拡大してから、
+            # 幅・高さを測り、その大きさまでビューポートを広げて撮る（縦横とも見切れ対策）
+            try {
+                $ifr = ("" + (Invoke-PageScriptSafe -Ws $Ws -Expression $script:PrepareIframesJs)) | ConvertFrom-Json
+                if ($ifr -and $ifr.cross) { Write-Warning "別サイト(クロスオリジン)のiframeは中身を展開できません（一部見切れる場合があります）" }
+            } catch {}
+            $iframePrepared = $true
+
+            $sz = ("" + (Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureSizeJs)) -split ','
+            $w = [int]$sz[0]; $full = if ($sz.Count -gt 1) { [int]$sz[1] } else { 0 }
+            if ($w -lt 1) { $w = $script:VpWidth }
             if ($full -lt 1) { $full = $script:VpHeight }
+            if ($w -gt $cap) { $w = $cap }
             if ($full -gt $cap) { $full = $cap }
-            Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full -Scale $script:VpScale
+            $dw = [Math]::Max($script:VpWidth, $w)
+            Set-Viewport -Ws $Ws -Width $dw -Height $full -Scale $script:VpScale
             $expanded = $true
             Start-Sleep -Milliseconds 400
-            # 遅延ロードで伸びる場合に備えて再測定し、必要なら更に広げる
-            $full2 = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
-            if ($full2 -gt $cap) { $full2 = $cap }
-            if ($full2 -gt $full) {
-                Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $full2 -Scale $script:VpScale
-                Start-Sleep -Milliseconds 400
-                $full = $full2
+            # 遅延ロードやレイアウト変化に備えて再測定し、必要なら更に広げる
+            $sz2 = ("" + (Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureSizeJs)) -split ','
+            $w2 = [int]$sz2[0]; $h2 = if ($sz2.Count -gt 1) { [int]$sz2[1] } else { 0 }
+            if ($w2 -gt $cap) { $w2 = $cap }
+            if ($h2 -gt $cap) { $h2 = $cap }
+            if ($w2 -gt $w -or $h2 -gt $full) {
+                if ($w2 -gt $w) { $w = $w2 }
+                if ($h2 -gt $full) { $full = $h2 }
+                $dw = [Math]::Max($script:VpWidth, $w)
+                Set-Viewport -Ws $Ws -Width $dw -Height $full -Scale $script:VpScale
+                Start-Sleep -Milliseconds 300
             }
+            if ($dw -gt $script:VpWidth) { Write-Host "  (横方向も展開して撮影: ${dw}x${full})" }
             $params.captureBeyondViewport = $true
-            $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $full; scale = 1 }
+            $params.clip = @{ x = 0; y = 0; width = $dw; height = $full; scale = 1 }
         }
     }
     $result = Invoke-CdpCommand -Ws $Ws -Method "Page.captureScreenshot" -Params $params
@@ -577,6 +657,10 @@ function Save-Screenshot {
     if ($modalPrepared) {
         # 一時的に変更したモーダルのスタイルを元に戻す
         try { Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalRestoreJs | Out-Null } catch {}
+    }
+    if ($iframePrepared) {
+        # 一時的に拡大した iframe のスタイルを元に戻す
+        try { Invoke-PageScriptSafe -Ws $Ws -Expression $script:IframeRestoreJs | Out-Null } catch {}
     }
     if ($expanded) {
         # 広げたビューポートを元のサイズに戻す

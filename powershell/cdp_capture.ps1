@@ -801,13 +801,14 @@ function Add-RecordSample {
     # 1) イベント(クリック/入力)を発生順に処理
     foreach ($e in @($obj.events)) {
         if ($e.type -eq "click") {
-            # クリックは1撮影ポイント（ページ内タブ切替・遷移リンク等）。
-            # 記録時のラベル文字列も保存し、再生時にセレクタが外れたらテキスト一致で探す。
+            # クリックはすぐページ化せず“保留”する。数ポーリング以内にURLが変われば
+            #   → 遷移リンク/サジェスト等 → 宛先URLへの goto として確定（URLで確実に再現できる）
+            # URLが変わらなければ
+            #   → ページ内クリック(タブ/モーダル等) → click として確定（ボタン名で照合）
+            if ($script:RecPendingClick) { Add-RecPage -Action $script:RecPendingClick -Verbose $Verbose }
             $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
             if ($e.text) { $clickAct.text = [string]$e.text }
-            Add-RecPage -Action $clickAct -Verbose $Verbose
-            # クリック起因の遷移は非同期で数百ms遅れることがある。数ポーリング分“猶予”を持たせ、
-            # その間のURL変化はこのクリックが起こしたものとみなして goto を二重に入れない。
+            $script:RecPendingClick = $clickAct
             $script:RecClickArmed = 3
         }
         elseif ($e.type -eq "fill" -or $e.type -eq "select") {
@@ -832,18 +833,23 @@ function Add-RecordSample {
             try { $sameOrigin = (([Uri]$url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$script:RecLastUrl).GetLeftPart([System.UriPartial]::Authority)) } catch {}
             if ($sameOrigin -and [int]$obj.load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
         }
-        if ($script:RecClickArmed -gt 0) {
-            # 直近のクリックが起こした遷移 → クリックで再現できるので goto は入れない
-            $script:RecClickArmed = 0
-        } else {
-            # クリック由来でない遷移（初期表示/戻る/アドレスバー/プログラム遷移）→ goto を撮影ポイントに
-            Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose
-        }
+        # 遷移が起きた → 宛先URLへの goto を撮影ポイントに。
+        # （保留クリックがあればそれが起こした遷移なので、click は破棄し goto で確実に再現する）
+        Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose
+        $script:RecPendingClick = $null
+        $script:RecClickArmed = 0
         $script:RecLastUrl = $url
     }
     if ($null -ne $obj.load) { $script:RecLastLoad = [int]$obj.load }
-    # クリック猶予を1ポーリング分ずつ減衰（遅延遷移をこのクリックに紐付けるための窓）
-    if ($script:RecClickArmed -gt 0) { $script:RecClickArmed-- }
+    # 猶予を1ポーリング分ずつ減衰。0になっても保留クリックが残っていれば
+    # 「URLを変えないページ内クリック(タブ/モーダル等)」として確定する。
+    if ($script:RecClickArmed -gt 0) {
+        $script:RecClickArmed--
+        if ($script:RecClickArmed -eq 0 -and $script:RecPendingClick) {
+            Add-RecPage -Action $script:RecPendingClick -Verbose $Verbose
+            $script:RecPendingClick = $null
+        }
+    }
 }
 
 function Start-Recording {
@@ -868,6 +874,7 @@ function Start-Recording {
     $script:RecPages       = New-Object System.Collections.ArrayList  # 確定した撮影ページ（順序どおり）
     $script:RecPending     = New-Object System.Collections.ArrayList  # 次の撮影ポイントまで保留する入力
     $script:RecLastUrl     = $null
+    $script:RecPendingClick = $null  # 後決め用に保留中のクリック（goto か click かは後で確定）
     $script:RecClickArmed  = 0       # クリック起因の遅延遷移を紐付ける残り猶予ポーリング数
     $script:RecLastLoad    = 0       # 直近のドキュメントロード回数
     $script:RecSawSpa      = $false  # SPAソフト遷移を1度でも検出したか
@@ -907,6 +914,8 @@ function Start-Recording {
         $json = $null
         try { $json = Invoke-PageScript -Ws $ws -Expression $script:DrainJs } catch { $json = $null }
         Add-RecordSample -Json $json -Verbose $false
+        # 未解決の保留クリックはページ内クリックとして確定
+        if ($script:RecPendingClick) { Add-RecPage -Action $script:RecPendingClick -Verbose $false; $script:RecPendingClick = $null }
         Add-RecPage -Action $null -Verbose $false
     } finally {
         try {

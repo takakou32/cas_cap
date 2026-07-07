@@ -433,40 +433,64 @@ $script:MeasureHeightJs = @'
 })()
 '@
 
-# 表示中のモーダル/ポップアップ(position:fixed のダイアログ等)を検出する。
-# これがある時は縦拡張するとfixed要素が崩れるため、ビューポートのまま撮る。
-$script:ModalCheckJs = @'
+# 表示中のモーダル/ポップアップを検出し、全体を撮れるよう一時的に整える。
+#   - ダイアログを左上(0,0)へ固定し、サイズ制約(max-width/height)を解除
+#   - 内部の横/縦スクロール領域の overflow を visible にして全内容を展開
+#   - data-capmodal="1" を付与し、変更内容を window.__capModalRestore に退避（復元用）
+# 戻り値: {found:bool, w, h}（CSSピクセルの必要サイズ）
+$script:ModalPrepareJs = @'
 (function(){
-  var sels=['[role=dialog]','[aria-modal="true"]','.p-dialog','.p-dialog-mask',
-            '.p-overlaypanel','.p-sidebar','.p-drawer','.p-confirmdialog',
-            '.modal.show','.modal.in','.el-overlay','.el-dialog__wrapper',
-            '.ant-modal-root','.ant-modal-wrap','.v-overlay--active','.MuiModal-root',
-            '.cdk-overlay-pane'];
-  for (var i=0;i<sels.length;i++){
-    var nodes; try { nodes=document.querySelectorAll(sels[i]); } catch(e){ continue; }
-    for (var j=0;j<nodes.length;j++){
-      var el=nodes[j];
-      var vis = el && (el.offsetParent!==null || (el.getClientRects && el.getClientRects().length>0));
-      if(!vis) continue;
-      var r=el.getBoundingClientRect();
-      if(r.width>40 && r.height>40) return true;
+  function vis(e){ return e && (e.offsetParent!==null || (e.getClientRects && e.getClientRects().length>0)); }
+  var sels=['[role=dialog]','[aria-modal="true"]','.p-dialog','.modal-dialog','.modal-content',
+            '.el-dialog','.ant-modal','.v-dialog__content','.MuiDialog-paper','.cdk-dialog-container',
+            '.p-confirmdialog','.p-sidebar','.p-drawer'];
+  var dlg=null, best=0, i, j;
+  for (i=0;i<sels.length;i++){
+    var ns; try { ns=document.querySelectorAll(sels[i]); } catch(e){ continue; }
+    for (j=0;j<ns.length;j++){ var e=ns[j]; if(!vis(e)) continue; var r=e.getBoundingClientRect(); var a=r.width*r.height; if(a>best && r.width>40 && r.height>40){ best=a; dlg=e; } }
+  }
+  if(!dlg){
+    // 汎用: 高z-indexで大きく覆う position:fixed 要素
+    var vw=window.innerWidth, vh=window.innerHeight, area=vw*vh, all=document.body?document.body.getElementsByTagName('*'):[], k;
+    for (k=0;k<all.length;k++){
+      var x=all[k], cs; try{ cs=getComputedStyle(x); }catch(_){ continue; }
+      if(cs.position!=='fixed') continue;
+      if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity||'1')<0.1) continue;
+      var z=parseInt(cs.zIndex,10); if(isNaN(z)) z=0; if(z<100) continue;
+      var rr=x.getBoundingClientRect();
+      if(rr.width*rr.height>area*0.5 && rr.width>vw*0.5 && rr.height>vh*0.4){ dlg=x; break; }
     }
   }
-  // 汎用: ビューポートの大部分を覆う高z-indexの position:fixed 要素（未知ライブラリの拡大表示/モーダル対策）
-  var vw=window.innerWidth, vh=window.innerHeight, area=vw*vh;
-  var all = document.body ? document.body.getElementsByTagName('*') : [];
-  for (var k=0;k<all.length;k++){
-    var x=all[k], cs;
-    try { cs=getComputedStyle(x); } catch(_){ continue; }
-    if (cs.position!=='fixed') continue;
-    if (cs.visibility==='hidden' || cs.display==='none' || parseFloat(cs.opacity||'1')<0.1) continue;
-    var z=parseInt(cs.zIndex,10); if(isNaN(z)) z=0;
-    if (z < 100) continue;
-    var rr=x.getBoundingClientRect();
-    if (rr.width*rr.height > area*0.5 && rr.width > vw*0.5 && rr.height > vh*0.4) return true;
+  if(!dlg) return JSON.stringify({found:false});
+  var changed=[];
+  function set(el,prop,val){ changed.push([el,prop,el.style.getPropertyValue(prop),el.style.getPropertyPriority(prop)]); el.style.setProperty(prop,val,'important'); }
+  set(dlg,'position','fixed'); set(dlg,'left','0px'); set(dlg,'top','0px');
+  set(dlg,'right','auto'); set(dlg,'bottom','auto'); set(dlg,'margin','0px');
+  set(dlg,'transform','none'); set(dlg,'max-width','none'); set(dlg,'max-height','none'); set(dlg,'overflow','visible');
+  var inner=dlg.getElementsByTagName('*');
+  for (var m=0;m<inner.length;m++){
+    var y=inner[m];
+    if(y.scrollWidth>y.clientWidth+1 || y.scrollHeight>y.clientHeight+1){
+      set(y,'overflow','visible'); set(y,'max-width','none'); set(y,'max-height','none');
+    }
   }
-  return false;
+  dlg.setAttribute('data-capmodal','1');
+  window.__capModalRestore=changed;
+  var r2=dlg.getBoundingClientRect();
+  var w=Math.max(dlg.scrollWidth, Math.ceil(r2.right));
+  var h=Math.max(dlg.scrollHeight, Math.ceil(r2.bottom));
+  return JSON.stringify({found:true, w:Math.ceil(w), h:Math.ceil(h)});
 })()
+'@
+
+# 準備後（ビューポート拡張後）に、モーダルの必要サイズを測り直す。戻り値 "w,h"
+$script:ModalMeasureJs = @'
+(function(){ var e=document.querySelector('[data-capmodal="1"]'); if(!e) return "0,0"; var r=e.getBoundingClientRect(); var w=Math.max(e.scrollWidth,Math.ceil(r.right)); var h=Math.max(e.scrollHeight,Math.ceil(r.bottom)); return Math.ceil(w)+","+Math.ceil(h); })()
+'@
+
+# ModalPrepareJs で変更したスタイルを元に戻す
+$script:ModalRestoreJs = @'
+(function(){ try{ var el=document.querySelector('[data-capmodal="1"]'); if(el) el.removeAttribute('data-capmodal'); var c=window.__capModalRestore||[]; for(var i=0;i<c.length;i++){ var it=c[i]; if(it[2]) it[0].style.setProperty(it[1],it[2],it[3]||''); else it[0].style.removeProperty(it[1]); } window.__capModalRestore=null; }catch(e){} return true; })()
 '@
 
 function Save-Screenshot {
@@ -474,17 +498,38 @@ function Save-Screenshot {
 
     $params = @{ format = "png" }
     $expanded = $false
+    $modalPrepared = $false
     if ($FullPage) {
-        $modal = $false
-        try { $modal = [bool](Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalCheckJs) } catch {}
-        if ($modal) {
-            # ポップアップ/モーダル表示中はビューポートのまま撮影（縦拡張するとfixed要素が崩れる）
-            Write-Host "  (モーダル検出: ビューポートで撮影)"
-            $params.captureBeyondViewport = $false
-            $params.clip = @{ x = 0; y = 0; width = $script:VpWidth; height = $script:VpHeight; scale = 1 }
+        $cap = 16384   # Chromiumのスクショ上限の目安
+        $mi = $null
+        try { $j = Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalPrepareJs; if ($j) { $mi = $j | ConvertFrom-Json } } catch {}
+        if ($mi -and $mi.found) {
+            # ポップアップ/モーダル: ダイアログ全体（横スクロール含む）を展開して撮る
+            $modalPrepared = $true
+            $mw = [int]$mi.w; $mh = [int]$mi.h
+            if ($mw -lt 1) { $mw = $script:VpWidth }
+            if ($mh -lt 1) { $mh = $script:VpHeight }
+            if ($mw -gt $cap) { $mw = $cap }
+            if ($mh -gt $cap) { $mh = $cap }
+            Set-Viewport -Ws $Ws -Width ([Math]::Max($script:VpWidth,$mw)) -Height ([Math]::Max($script:VpHeight,$mh)) -Scale $script:VpScale
+            $expanded = $true
+            Start-Sleep -Milliseconds 400
+            # 拡張後にレイアウトが変わることがあるので測り直し、必要なら更に広げる
+            $mm = ("" + (Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalMeasureJs)) -split ','
+            $mw2 = [int]$mm[0]; $mh2 = if ($mm.Count -gt 1) { [int]$mm[1] } else { 0 }
+            if ($mw2 -gt $cap) { $mw2 = $cap }
+            if ($mh2 -gt $cap) { $mh2 = $cap }
+            if ($mw2 -gt $mw -or $mh2 -gt $mh) {
+                if ($mw2 -gt $mw) { $mw = $mw2 }
+                if ($mh2 -gt $mh) { $mh = $mh2 }
+                Set-Viewport -Ws $Ws -Width ([Math]::Max($script:VpWidth,$mw)) -Height ([Math]::Max($script:VpHeight,$mh)) -Scale $script:VpScale
+                Start-Sleep -Milliseconds 300
+            }
+            Write-Host "  (ポップアップ全体を撮影: ${mw}x${mh})"
+            $params.captureBeyondViewport = $true
+            $params.clip = @{ x = 0; y = 0; width = $mw; height = $mh; scale = 1 }
         } else {
-            $cap = 16384   # Chromiumのスクショ高さ上限の目安
-            # 実コンテンツ高さを測り、その高さまでビューポートを広げてレイアウトを展開させる
+            # 通常ページ: 実コンテンツ高さを測り、その高さまでビューポートを広げて縦長で撮る
             $full = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $script:MeasureHeightJs)
             if ($full -lt 1) { $full = $script:VpHeight }
             if ($full -gt $cap) { $full = $cap }
@@ -506,6 +551,10 @@ function Save-Screenshot {
     $result = Invoke-CdpCommand -Ws $Ws -Method "Page.captureScreenshot" -Params $params
     [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String($result.data))
 
+    if ($modalPrepared) {
+        # 一時的に変更したモーダルのスタイルを元に戻す
+        try { Invoke-PageScriptSafe -Ws $Ws -Expression $script:ModalRestoreJs | Out-Null } catch {}
+    }
     if ($expanded) {
         # 広げたビューポートを元のサイズに戻す
         Set-Viewport -Ws $Ws -Width $script:VpWidth -Height $script:VpHeight -Scale $script:VpScale

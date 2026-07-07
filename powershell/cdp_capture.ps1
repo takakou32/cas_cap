@@ -441,32 +441,48 @@ $script:MeasureHeightJs = @'
 $script:ModalPrepareJs = @'
 (function(){
   function vis(e){ return e && (e.offsetParent!==null || (e.getClientRects && e.getClientRects().length>0)); }
-  var sels=['[role=dialog]','[aria-modal="true"]','.p-dialog','.modal-dialog','.modal-content',
-            '.el-dialog','.ant-modal','.v-dialog__content','.MuiDialog-paper','.cdk-dialog-container',
-            '.p-confirmdialog','.p-sidebar','.p-drawer'];
-  var dlg=null, best=0, i, j;
-  for (i=0;i<sels.length;i++){
-    var ns; try { ns=document.querySelectorAll(sels[i]); } catch(e){ continue; }
-    for (j=0;j<ns.length;j++){ var e=ns[j]; if(!vis(e)) continue; var r=e.getBoundingClientRect(); var a=r.width*r.height; if(a>best && r.width>40 && r.height>40){ best=a; dlg=e; } }
+  function area(e){ var r=e.getBoundingClientRect(); return r.width*r.height; }
+  var changed=[];
+  function set(el,prop,val){ changed.push([el,prop,el.style.getPropertyValue(prop),el.style.getPropertyPriority(prop)]); el.style.setProperty(prop,val,'important'); }
+  // 1) マスク/オーバーレイ（全画面の背景）を探す
+  var maskSel=['.p-dialog-mask','.p-component-overlay','.modal.show','.modal.in','.modal',
+               '.el-overlay','.ant-modal-wrap','.ant-modal-root','.MuiModal-root',
+               '.cdk-overlay-container','[aria-modal="true"]','[role=dialog]'];
+  var mask=null, best=0, i, j;
+  for (i=0;i<maskSel.length;i++){
+    var ns; try { ns=document.querySelectorAll(maskSel[i]); } catch(e){ continue; }
+    for (j=0;j<ns.length;j++){ var e2=ns[j]; if(!vis(e2)) continue; var a=area(e2); if(a>best && a>1600){ best=a; mask=e2; } }
   }
-  if(!dlg){
+  if(!mask){
     // 汎用: 高z-indexで大きく覆う position:fixed 要素
-    var vw=window.innerWidth, vh=window.innerHeight, area=vw*vh, all=document.body?document.body.getElementsByTagName('*'):[], k;
+    var vw=window.innerWidth, vh=window.innerHeight, ar=vw*vh, all=document.body?document.body.getElementsByTagName('*'):[], k;
     for (k=0;k<all.length;k++){
       var x=all[k], cs; try{ cs=getComputedStyle(x); }catch(_){ continue; }
       if(cs.position!=='fixed') continue;
       if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity||'1')<0.1) continue;
       var z=parseInt(cs.zIndex,10); if(isNaN(z)) z=0; if(z<100) continue;
       var rr=x.getBoundingClientRect();
-      if(rr.width*rr.height>area*0.5 && rr.width>vw*0.5 && rr.height>vh*0.4){ dlg=x; break; }
+      if(rr.width*rr.height>ar*0.5 && rr.width>vw*0.5 && rr.height>vh*0.4){ mask=x; break; }
     }
   }
-  if(!dlg) return JSON.stringify({found:false});
-  var changed=[];
-  function set(el,prop,val){ changed.push([el,prop,el.style.getPropertyValue(prop),el.style.getPropertyPriority(prop)]); el.style.setProperty(prop,val,'important'); }
+  if(!mask) return JSON.stringify({found:false});
+  // 2) マスク内の実ダイアログ本体を探す（無ければマスク自身を対象）
+  var dlg=null;
+  try { dlg=mask.querySelector('.p-dialog,.modal-dialog,.modal-content,.el-dialog,.ant-modal,.MuiDialog-paper,.v-dialog__content,[role=dialog]'); } catch(e){}
+  if(!dlg || !vis(dlg)) dlg=mask;
+  // 3) 祖先の transform/overflow を一時無効化（position:fixed をビューポート基準にし、クリップを防ぐ）
+  var anc=dlg.parentElement;
+  while(anc && anc!==document.documentElement){
+    var acs=null; try{ acs=getComputedStyle(anc); }catch(_){}
+    if(acs && ((acs.transform&&acs.transform!=='none')||(acs.filter&&acs.filter!=='none'))){ set(anc,'transform','none'); set(anc,'filter','none'); }
+    set(anc,'overflow','visible');
+    anc=anc.parentElement;
+  }
+  // 4) ダイアログを左上(0,0)へ固定＋サイズ制約を解除
   set(dlg,'position','fixed'); set(dlg,'left','0px'); set(dlg,'top','0px');
   set(dlg,'right','auto'); set(dlg,'bottom','auto'); set(dlg,'margin','0px');
   set(dlg,'transform','none'); set(dlg,'max-width','none'); set(dlg,'max-height','none'); set(dlg,'overflow','visible');
+  // 5) 内部の横/縦スクロール領域を展開
   var inner=dlg.getElementsByTagName('*');
   for (var m=0;m<inner.length;m++){
     var y=inner[m];

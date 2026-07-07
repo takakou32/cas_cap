@@ -496,16 +496,19 @@ $script:ModalPrepareJs = @'
   }
   dlg.setAttribute('data-capmodal','1');
   window.__capModalRestore=changed;
-  var r2=dlg.getBoundingClientRect();
-  var w=Math.max(dlg.scrollWidth, Math.ceil(r2.right));
-  var h=Math.max(dlg.scrollHeight, Math.ceil(r2.bottom));
-  return JSON.stringify({found:true, w:Math.ceil(w), h:Math.ceil(h)});
+  // overflow:visible 展開後は scrollWidth が箱サイズに戻り当てにならないので、
+  // 全子孫の描画範囲(右端/下端)から実サイズを求める（dlgは0,0固定なので right=実幅）。
+  var maxR=0, maxB=0, b0=dlg.getBoundingClientRect();
+  if(b0.right>maxR) maxR=b0.right; if(b0.bottom>maxB) maxB=b0.bottom;
+  var alld=dlg.getElementsByTagName('*');
+  for(var q=0;q<alld.length;q++){ var qr=alld[q].getBoundingClientRect(); if(qr.width>0||qr.height>0){ if(qr.right>maxR)maxR=qr.right; if(qr.bottom>maxB)maxB=qr.bottom; } }
+  return JSON.stringify({found:true, w:Math.ceil(maxR), h:Math.ceil(maxB)});
 })()
 '@
 
 # 準備後（ビューポート拡張後）に、モーダルの必要サイズを測り直す。戻り値 "w,h"
 $script:ModalMeasureJs = @'
-(function(){ var e=document.querySelector('[data-capmodal="1"]'); if(!e) return "0,0"; var r=e.getBoundingClientRect(); var w=Math.max(e.scrollWidth,Math.ceil(r.right)); var h=Math.max(e.scrollHeight,Math.ceil(r.bottom)); return Math.ceil(w)+","+Math.ceil(h); })()
+(function(){ var e=document.querySelector('[data-capmodal="1"]'); if(!e) return "0,0"; var maxR=0,maxB=0,b=e.getBoundingClientRect(); if(b.right>maxR)maxR=b.right; if(b.bottom>maxB)maxB=b.bottom; var all=e.getElementsByTagName('*'); for(var i=0;i<all.length;i++){ var r=all[i].getBoundingClientRect(); if(r.width>0||r.height>0){ if(r.right>maxR)maxR=r.right; if(r.bottom>maxB)maxB=r.bottom; } } return Math.ceil(maxR)+","+Math.ceil(maxB); })()
 '@
 
 # ModalPrepareJs で変更したスタイルを元に戻す

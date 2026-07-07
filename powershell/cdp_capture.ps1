@@ -240,7 +240,8 @@ function Invoke-CapAction {
 
     switch ($Action.type) {
         "click" {
-            # セレクタで待機 → 見つからなければ記録時のテキストで一致検索 → それでも無ければスキップ
+            # ハイブリッド特定：セレクタで当てた要素を「記録時のボタン名(text/aria-label)」で検証する。
+            # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
             $sel = ConvertTo-JsLiteral $Action.selector
             $txt = ConvertTo-JsLiteral ([string]$Action.text)
             $to  = $script:ActionTimeoutMs
@@ -248,25 +249,44 @@ function Invoke-CapAction {
 new Promise((resolve) => {
   const sel = $sel, text = $txt, deadline = Date.now() + $to;
   function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  function txtOf(e){
+    var s=(e.innerText||e.textContent||'').trim();
+    if(!s){ try { s=((e.getAttribute('aria-label')||e.getAttribute('title'))||'').trim(); } catch(_){} }
+    return s;
+  }
+  function matches(a,b){
+    if(!a||!b) return false;
+    if(a===b) return true;
+    return (b.length>=2 && a.indexOf(b)>=0) || (a.length>=2 && b.indexOf(a)>=0);
+  }
   function byText(){
     if (!text) return null;
     var list = Array.prototype.slice.call(document.querySelectorAll('a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[tabindex],[onclick]')).filter(visible);
-    return list.find(function(e){ return (e.innerText||e.textContent||'').trim() === text; })
-        || list.find(function(e){ return (e.innerText||e.textContent||'').trim().indexOf(text) >= 0; });
+    return list.find(function(e){ return txtOf(e) === text; })
+        || list.find(function(e){ return matches(txtOf(e), text); });
   }
+  function go(e,how){ e.scrollIntoView({block:'center'}); e.click(); return resolve(how); }
   (function check(){
     var el = null; try { el = document.querySelector(sel); } catch(e){}
-    if (visible(el)) { el.scrollIntoView({block:'center'}); el.click(); return resolve('clicked'); }
+    // 1) セレクタが当たり、かつ(テキスト未記録 or ラベル一致) → それをクリック
+    if (visible(el) && (!text || matches(txtOf(el), text))) return go(el, 'clicked');
+    // 2) ラベル一致の要素を探す（順番が変わっても“ボタン名”で当てる）
     var c = byText();
-    if (c) { c.scrollIntoView({block:'center'}); c.click(); return resolve('text'); }
+    if (c) return go(c, 'text');
+    // 3) テキスト情報が無い時のみ、位置一致のセレクタ要素をクリック（アイコン等）
+    if (visible(el) && !text) return go(el, 'clicked-notext');
+    // 4) テキストはあるが一致要素が無い → まだ描画中かもしれないので待つ
     if (Date.now() > deadline) return resolve('notfound');
     setTimeout(check, 150);
   })();
 })
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
-            if ($st -eq 'notfound') { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
-            elseif ($st -eq 'text') { Write-Host "  (テキスト一致でクリック: $($Action.text))" }
+            switch ($st) {
+                'notfound'       { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
+                'text'           { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
+                'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector))" }
+            }
         }
         "fill" {
             $sel = ConvertTo-JsLiteral $Action.selector
@@ -690,8 +710,9 @@ $script:RecorderJs = @'
       var ty=(t.type||"").toLowerCase();
       if(ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio") return; // テキスト入力はfillで扱う
     }
-    var label=((t.innerText||t.textContent||"").trim()).slice(0,80);
-    push({type:"click", selector:cssPath(t), text:label});
+    var label=(t.innerText||t.textContent||"").trim();
+    if(!label){ label=((t.getAttribute&&(t.getAttribute("aria-label")||t.getAttribute("title")))||"").trim(); }
+    push({type:"click", selector:cssPath(t), text:label.slice(0,80)});
   };
   var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
@@ -785,7 +806,9 @@ function Add-RecordSample {
             $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
             if ($e.text) { $clickAct.text = [string]$e.text }
             Add-RecPage -Action $clickAct -Verbose $Verbose
-            $script:RecLastWasClick = $true
+            # クリック起因の遷移は非同期で数百ms遅れることがある。数ポーリング分“猶予”を持たせ、
+            # その間のURL変化はこのクリックが起こしたものとみなして goto を二重に入れない。
+            $script:RecClickArmed = 3
         }
         elseif ($e.type -eq "fill" -or $e.type -eq "select") {
             # 入力は次の撮影ポイントまで保留（同一セレクタは最後の値で上書き）
@@ -809,19 +832,18 @@ function Add-RecordSample {
             try { $sameOrigin = (([Uri]$url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$script:RecLastUrl).GetLeftPart([System.UriPartial]::Authority)) } catch {}
             if ($sameOrigin -and [int]$obj.load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
         }
-        if ($script:RecLastWasClick) {
-            # 直前のクリックが遷移を起こした → クリックで再現できるので goto は入れない
-            $script:RecLastWasClick = $false
+        if ($script:RecClickArmed -gt 0) {
+            # 直近のクリックが起こした遷移 → クリックで再現できるので goto は入れない
+            $script:RecClickArmed = 0
         } else {
-            # クリック由来でない遷移（初期表示/戻る/プログラム遷移）→ goto を撮影ポイントに
+            # クリック由来でない遷移（初期表示/戻る/アドレスバー/プログラム遷移）→ goto を撮影ポイントに
             Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose
         }
         $script:RecLastUrl = $url
-    } else {
-        # URLは不変。直前クリックがページ内遷移(タブ等)だった場合は既にclickページ済み
-        if ($script:RecLastWasClick) { $script:RecLastWasClick = $false }
     }
     if ($null -ne $obj.load) { $script:RecLastLoad = [int]$obj.load }
+    # クリック猶予を1ポーリング分ずつ減衰（遅延遷移をこのクリックに紐付けるための窓）
+    if ($script:RecClickArmed -gt 0) { $script:RecClickArmed-- }
 }
 
 function Start-Recording {
@@ -846,7 +868,7 @@ function Start-Recording {
     $script:RecPages       = New-Object System.Collections.ArrayList  # 確定した撮影ページ（順序どおり）
     $script:RecPending     = New-Object System.Collections.ArrayList  # 次の撮影ポイントまで保留する入力
     $script:RecLastUrl     = $null
-    $script:RecLastWasClick = $false
+    $script:RecClickArmed  = 0       # クリック起因の遅延遷移を紐付ける残り猶予ポーリング数
     $script:RecLastLoad    = 0       # 直近のドキュメントロード回数
     $script:RecSawSpa      = $false  # SPAソフト遷移を1度でも検出したか
     $script:RecPageName    = $PageName

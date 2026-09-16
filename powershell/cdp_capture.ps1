@@ -29,13 +29,13 @@
     goto に変換せず click のまま残すので、入力した宛名番号に応じて遷移先が変わる
 
 .PARAMETER KojinNo
-    （記録時）記録に使った宛名番号。バッチ実行時にこの番号を bat の宛名番号へ差し替える
+    （記録時）記録に使った宛名番号。バッチ実行時にこの番号を CSV の宛名番号へ差し替える
 
 .PARAMETER Batch
-    バッチ実行モード。-BatFile の bat と -Mapping の対応表に従い、全件を自動キャプチャする
+    バッチ実行モード。-CsvFile の CSV と -Mapping の対応表に従い、全件を自動キャプチャする
 
-.PARAMETER BatFile
-    （バッチ時）別ツールが出力した bat（set taisho_title=… / set taisho_kojinNo=… の2行）
+.PARAMETER CsvFile
+    （バッチ時）別ツールが出力した CSV（ヘッダなし・囲み文字なし。1行 = チェック項目,宛名番号）
 
 .PARAMETER Mapping
     （バッチ時）チェック項目と記録の対応表（デフォルト: config/mapping.json）
@@ -47,7 +47,7 @@
 .EXAMPLE
     .\powershell\cdp_capture.ps1 -Record -ClickNav -KojinNo 11111 -OutConfig config/rec_inkan.json
 .EXAMPLE
-    .\powershell\cdp_capture.ps1 -Batch -BatFile .\list.bat -Mapping config/mapping.json
+    .\powershell\cdp_capture.ps1 -Batch -CsvFile .\list.csv -Mapping config/mapping.json
 #>
 
 [CmdletBinding()]
@@ -62,7 +62,7 @@ param(
     [switch]$ClickNav,
     [string]$KojinNo,
     [switch]$Batch,
-    [string]$BatFile,
+    [string]$CsvFile,
     [string]$Mapping = "config/mapping.json"
 )
 
@@ -1247,11 +1247,11 @@ function Start-Recording {
 }
 
 # ---------------------------------------------------------------------------
-# バッチ実行（別ツール出力の bat × 対応表 → 宛名番号を差し替えて全件キャプチャ）
+# バッチ実行（別ツール出力の CSV × 対応表 → 宛名番号を差し替えて全件キャプチャ）
 # ---------------------------------------------------------------------------
 
 # テキストファイルを文字コード自動判定で読む（UTF-8(BOM有/無) → 不正なら Shift_JIS(CP932)）
-# 別ツールが出力する bat は Shift_JIS のことが多いため。
+# 別ツールが出力する CSV は Shift_JIS のことが多いため。
 function Read-TextAuto {
     param([string]$Path)
     $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).ProviderPath)
@@ -1266,41 +1266,29 @@ function Read-TextAuto {
     }
 }
 
-# "a/b/c" を分割する。前後の空白は除去し、末尾の "/" による空要素だけ取り除く
-# （途中の空要素は件数ズレを検出できるよう残す）
-function Split-BatList {
-    param([string]$Value)
-    $list = New-Object System.Collections.Generic.List[string]
-    foreach ($s in ($Value -split '/')) { $list.Add($s.Trim()) }
-    while ($list.Count -gt 0 -and $list[$list.Count - 1] -eq '') { $list.RemoveAt($list.Count - 1) }
-    return ,$list.ToArray()
-}
-
-# bat を読み、チェック項目と宛名番号のペア一覧を返す。形式不正・件数不一致は例外
-function Read-BatPairs {
+# CSV を読み、チェック項目と宛名番号の組の一覧を返す。
+# 形式: ヘッダなし・囲み文字なし・1行 = 「チェック項目,宛名番号」。空行は無視。
+# 戻り値: Pairs（Line, Title, KojinNo の一覧）と Invalid（列が2つでない行の理由一覧）
+function Read-CsvPairs {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { throw "batファイルが見つかりません: $Path" }
-    $vars = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { throw "CSVファイルが見つかりません: $Path" }
+
+    $pairs   = New-Object System.Collections.ArrayList
+    $invalid = New-Object System.Collections.Generic.List[string]
+    $lineNo = 0
     foreach ($line in ((Read-TextAuto -Path $Path) -split "`r?`n")) {
-        # set taisho_title=…  と  set "taisho_title=…"  の両方に対応
-        $m = [regex]::Match($line, '^\s*set\s+"?([A-Za-z_][A-Za-z0-9_]*)=(.*?)"?\s*$', 'IgnoreCase')
-        if ($m.Success) { $vars[$m.Groups[1].Value] = $m.Groups[2].Value }
+        $lineNo++
+        if ($line.Trim() -eq '') { continue }
+        $cols = $line -split ','
+        if ($cols.Count -ne 2) {
+            # 取り違え防止: 列数が合わない行は推測で読まず、その行だけ飛ばす
+            $invalid.Add("${lineNo}行目: 列が2つではありません（$($cols.Count)列）: $line")
+            continue
+        }
+        [void]$pairs.Add([pscustomobject]@{ Line = $lineNo; Title = $cols[0].Trim(); KojinNo = $cols[1].Trim() })
     }
-    if (-not $vars.ContainsKey("taisho_title"))   { throw "bat に set taisho_title=… の行がありません: $Path" }
-    if (-not $vars.ContainsKey("taisho_kojinNo")) { throw "bat に set taisho_kojinNo=… の行がありません: $Path" }
-
-    $titles = Split-BatList -Value $vars["taisho_title"]
-    $nos    = Split-BatList -Value $vars["taisho_kojinNo"]
-    if ($titles.Count -ne $nos.Count) {
-        throw "チェック項目と宛名番号の件数が一致しません（taisho_title=$($titles.Count)件 / taisho_kojinNo=$($nos.Count)件）。取り違え防止のため中止します。"
-    }
-    if ($titles.Count -eq 0) { throw "bat に対象が1件もありません: $Path" }
-
-    $pairs = New-Object System.Collections.ArrayList
-    for ($i = 0; $i -lt $titles.Count; $i++) {
-        [void]$pairs.Add([pscustomobject]@{ Title = $titles[$i]; KojinNo = $nos[$i] })
-    }
-    return ,$pairs
+    if ($pairs.Count -eq 0 -and $invalid.Count -eq 0) { throw "CSV に対象が1件もありません: $Path" }
+    return [pscustomobject]@{ Pairs = $pairs; Invalid = $invalid }
 }
 
 # 対応表を読む
@@ -1381,9 +1369,10 @@ function ConvertTo-SafeFileName {
 
 # バッチ本体。全件成功なら $true、スキップ/失敗が1件でもあれば $false
 function Invoke-Batch {
-    param([string]$BatFile, [string]$MappingPath, [string]$CdpUrl)
+    param([string]$CsvFile, [string]$MappingPath, [string]$CdpUrl)
 
-    $pairs = Read-BatPairs -Path $BatFile
+    $csv   = Read-CsvPairs -Path $CsvFile
+    $pairs = $csv.Pairs
     $map   = Read-BatchMapping -Path $MappingPath
 
     $runTs   = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -1391,7 +1380,7 @@ function Invoke-Batch {
     $runDir  = Join-Path $outRoot "batch_$runTs"
 
     Write-Host "=== バッチ実行 ==="
-    Write-Host "bat    : $BatFile"
+    Write-Host "CSV    : $CsvFile"
     Write-Host "対応表 : $MappingPath"
     Write-Host "件数   : $($pairs.Count) 件"
     Write-Host "出力先 : $runDir"
@@ -1400,10 +1389,16 @@ function Invoke-Batch {
     $skipped = New-Object System.Collections.Generic.List[string]
     $failed  = New-Object System.Collections.Generic.List[string]
 
+    # 列数が合わず読み飛ばした行
+    foreach ($bad in $csv.Invalid) {
+        Write-Warning "スキップ: $bad"
+        $skipped.Add($bad)
+    }
+
     $idx = 0
     foreach ($p in $pairs) {
         $idx++
-        $label = "[$idx/$($pairs.Count)] $($p.Title) / 宛名番号 $($p.KojinNo)"
+        $label = "[$idx/$($pairs.Count)] $($p.Line)行目 $($p.Title) / 宛名番号 $($p.KojinNo)"
         Write-Host ""
         Write-Host "---- $label ----"
 
@@ -1487,13 +1482,13 @@ if ($List) {
     $baseUrl = if ($CdpUrl) { $CdpUrl } else { "http://localhost:9222" }
     Show-Tabs -BaseUrl $baseUrl
 } elseif ($Batch) {
-    if (-not $BatFile) {
-        Write-Host "-BatFile で bat ファイルを指定してください" -ForegroundColor Red
+    if (-not $CsvFile) {
+        Write-Host "-CsvFile で CSV ファイルを指定してください" -ForegroundColor Red
         exit 1
     }
     $allOk = $false
     try {
-        $allOk = @(Invoke-Batch -BatFile $BatFile -MappingPath $Mapping -CdpUrl $CdpUrl)[-1]
+        $allOk = @(Invoke-Batch -CsvFile $CsvFile -MappingPath $Mapping -CdpUrl $CdpUrl)[-1]
     } catch {
         Write-Host "バッチを実行できません: $($_.Exception.Message)" -ForegroundColor Red
         exit 1

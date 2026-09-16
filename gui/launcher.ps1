@@ -191,9 +191,9 @@ $txtKojin.Size = New-Object System.Drawing.Size(140, 22)
 $txtKojin.Enabled = $false
 $gbMode.Controls.Add($txtKojin)
 
-# バッチ実行: 別ツールが出力した bat と、チェック項目→記録の対応表
+# バッチ実行: 別ツールが出力した CSV と、チェック項目→記録の対応表
 $lblBat = New-Object System.Windows.Forms.Label
-$lblBat.Text = "bat"
+$lblBat.Text = "CSV"
 $lblBat.Location = New-Object System.Drawing.Point(15, 113)
 $lblBat.Size = New-Object System.Drawing.Size(50, 20)
 $gbMode.Controls.Add($lblBat)
@@ -295,7 +295,7 @@ $updateModeFields = {
     $txtMap.Enabled      = $isBatch
     $btnMap.Enabled      = $isBatch
     $lblModeHint.Text = if ($isBatch) {
-        "バッチ実行: bat のチェック項目×宛名番号ごとに、対応表の記録で全件を自動撮影します。事前に Edge 起動とアプリへのログインが必要です。"
+        "バッチ実行: CSV のチェック項目×宛名番号ごとに、対応表の記録で全件を自動撮影します。事前に Edge 起動とアプリへのログインが必要です。"
     } elseif ($isRec) {
         "操作記録: 画面を順に記録し、Enter で出力先に保存。バッチ用は「バッチ用に記録」をオンにし、ここに入れた宛名番号を検索欄に入力して記録してください。"
     } elseif ($rbList.Checked) {
@@ -321,10 +321,10 @@ $btnBrowse.Add_Click({
     }
 })
 
-# bat 参照
+# CSV 参照
 $btnBat.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Filter = "バッチファイル (*.bat;*.cmd)|*.bat;*.cmd|すべて (*.*)|*.*"
+    $dlg.Filter = "CSV (*.csv)|*.csv|すべて (*.*)|*.*"
     $dlg.InitialDirectory = $RepoRoot
     if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $txtBat.Text = $dlg.FileName
@@ -375,11 +375,11 @@ $btnRun.Add_Click({
             $bat = $txtBat.Text.Trim()
             $map = $txtMap.Text.Trim()
             if (-not $bat) {
-                [System.Windows.Forms.MessageBox]::Show("bat ファイルを指定してください。", "入力エラー") | Out-Null
+                [System.Windows.Forms.MessageBox]::Show("CSV ファイルを指定してください。", "入力エラー") | Out-Null
                 return
             }
             if (-not $map) { $map = "config/mapping.json" }
-            $a = "-Batch -BatFile $(ConvertTo-PsArg $bat) -Mapping $(ConvertTo-PsArg $map)"
+            $a = "-Batch -CsvFile $(ConvertTo-PsArg $bat) -Mapping $(ConvertTo-PsArg $map)"
         }
         else {
             $a = "-Config $(ConvertTo-PsArg $cfg)"

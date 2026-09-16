@@ -21,10 +21,33 @@
 .PARAMETER CdpUrl
     CDPのURL（指定時は設定ファイルの cdp_url を上書き）
 
+.PARAMETER Record
+    操作記録モード。ブラウザ操作を記録して -OutConfig に保存する
+
+.PARAMETER ClickNav
+    （記録時）バッチ用の記録にする。URLが変わるクリック（サジェスト候補の選択など）も
+    goto に変換せず click のまま残すので、入力した宛名番号に応じて遷移先が変わる
+
+.PARAMETER KojinNo
+    （記録時）記録に使った宛名番号。バッチ実行時にこの番号を bat の宛名番号へ差し替える
+
+.PARAMETER Batch
+    バッチ実行モード。-BatFile の bat と -Mapping の対応表に従い、全件を自動キャプチャする
+
+.PARAMETER BatFile
+    （バッチ時）別ツールが出力した bat（set taisho_title=… / set taisho_kojinNo=… の2行）
+
+.PARAMETER Mapping
+    （バッチ時）チェック項目と記録の対応表（デフォルト: config/mapping.json）
+
 .EXAMPLE
     .\powershell\cdp_capture.ps1 --list
 .EXAMPLE
     .\powershell\cdp_capture.ps1 -Config config/my_config.json
+.EXAMPLE
+    .\powershell\cdp_capture.ps1 -Record -ClickNav -KojinNo 11111 -OutConfig config/rec_inkan.json
+.EXAMPLE
+    .\powershell\cdp_capture.ps1 -Batch -BatFile .\list.bat -Mapping config/mapping.json
 #>
 
 [CmdletBinding()]
@@ -35,7 +58,12 @@ param(
     [string]$CdpUrl,
     [switch]$Record,
     [string]$Name = "recorded",
-    [string]$OutConfig = "config/recorded.json"
+    [string]$OutConfig = "config/recorded.json",
+    [switch]$ClickNav,
+    [string]$KojinNo,
+    [switch]$Batch,
+    [string]$BatFile,
+    [string]$Mapping = "config/mapping.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -242,12 +270,15 @@ function Invoke-CapAction {
         "click" {
             # ハイブリッド特定：セレクタで当てた要素を「記録時のボタン名(text/aria-label)」で検証する。
             # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
+            # click_nav(宛名番号差し替え運用)の記録では、サジェスト候補の表示名(氏名)が番号ごとに
+            # 変わるため、ラベル不一致でもセレクタ位置の要素をクリックして進む。
             $sel = ConvertTo-JsLiteral $Action.selector
             $txt = ConvertTo-JsLiteral ([string]$Action.text)
             $to  = $script:ActionTimeoutMs
+            $lenient = if ($script:ClickNavMode) { "true" } else { "false" }
             $expr = @"
 new Promise((resolve) => {
-  const sel = $sel, text = $txt, deadline = Date.now() + $to;
+  const sel = $sel, text = $txt, deadline = Date.now() + $to, lenient = $lenient;
   function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
   function txtOf(e){
     var s=(e.innerText||e.textContent||'').trim();
@@ -273,8 +304,8 @@ new Promise((resolve) => {
     // 2) ラベル一致の要素を探す（順番が変わっても“ボタン名”で当てる）
     var c = byText();
     if (c) return go(c, 'text');
-    // 3) テキスト情報が無い時のみ、位置一致のセレクタ要素をクリック（アイコン等）
-    if (visible(el) && !text) return go(el, 'clicked-notext');
+    // 3) テキスト情報が無い時（アイコン等）、または click_nav 記録の時は位置一致のセレクタ要素をクリック
+    if (visible(el) && (!text || lenient)) return go(el, text ? 'clicked-position' : 'clicked-notext');
     // 4) テキストはあるが一致要素が無い → まだ描画中かもしれないので待つ
     if (Date.now() > deadline) return resolve('notfound');
     setTimeout(check, 150);
@@ -283,8 +314,9 @@ new Promise((resolve) => {
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
             switch ($st) {
-                'notfound'       { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
-                'text'           { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
+                'notfound'         { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
+                'text'             { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
+                'clicked-position' { Write-Host "  (位置でクリック: $($Action.selector))" }
                 'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector))" }
             }
         }
@@ -684,12 +716,15 @@ function Show-Tabs {
 # ---------------------------------------------------------------------------
 # キャプチャ本体
 # ---------------------------------------------------------------------------
+# 戻り値: 対象タブに接続して処理できたら $true、タブが見つからなければ $false
+#   -OutDir     : 出力先フォルダ（省略時は設定の output_dir）
+#   -FilePrefix : ファイル名の接頭辞（省略時は実行日時）。バッチでは「宛名番号_大分類_小分類」
 function Invoke-Capture {
-    param($Cfg)
+    param($Cfg, [string]$OutDir, [string]$FilePrefix)
 
     $baseUrl    = if ($Cfg.cdp_url) { $Cfg.cdp_url } else { "http://localhost:9222" }
     $keyword    = if ($Cfg.target_url_keyword) { $Cfg.target_url_keyword } else { "" }
-    $outputDir  = if ($Cfg.output_dir) { $Cfg.output_dir } else { "output" }
+    $outputDir  = if ($OutDir) { $OutDir } elseif ($Cfg.output_dir) { $Cfg.output_dir } else { "output" }
     $fullPage   = if ($null -ne $Cfg.full_page) { [bool]$Cfg.full_page } else { $true }
     $settleMs   = if ($null -ne $Cfg.settle_ms) { [int]$Cfg.settle_ms } else { 800 }
     $pagesCfg   = if ($Cfg.pages) { @($Cfg.pages) } else { @() }
@@ -715,11 +750,14 @@ function Invoke-Capture {
 
     # SPA(Vue等)の認証付きシステム向け: goto をリロードせず pushState で行う
     $script:SpaMode = if ($null -ne $Cfg.spa_mode) { [bool]$Cfg.spa_mode } else { $false }
+    # 宛名番号差し替え運用の記録(-ClickNav で記録)か
+    $script:ClickNavMode = if ($null -ne $Cfg.click_nav) { [bool]$Cfg.click_nav } else { $false }
 
     if (-not (Test-Path $outputDir)) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     }
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+    $prefix = if ($FilePrefix) { $FilePrefix } else { $ts }
 
     # 対象タブを探す
     $tabs = Get-CdpTabs -BaseUrl $baseUrl
@@ -728,7 +766,7 @@ function Invoke-Capture {
         Write-Host "対象タブが見つかりません (keyword: $keyword)"
         Write-Host "タブ一覧:"
         foreach ($t in $tabs) { Write-Host "  $($t.url)" }
-        exit 1
+        return $false
     }
 
     Write-Host "Edge接続成功"
@@ -742,7 +780,8 @@ function Invoke-Capture {
 
         if ($pagesCfg.Count -eq 0) {
             # ページ設定がなければ現在の画面をキャプチャ
-            $filename = Join-Path $outputDir "capture_$ts.png"
+            $single = if ($FilePrefix) { "${FilePrefix}_capture.png" } else { "capture_$ts.png" }
+            $filename = Join-Path $outputDir $single
             Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
             Write-Host "キャプチャ保存: $filename"
         } else {
@@ -761,7 +800,7 @@ function Invoke-Capture {
                     Write-Warning "ページ '$name' の操作中にエラー(撮影は継続): $_"
                 }
 
-                $filename = Join-Path $outputDir "${ts}_${name}.png"
+                $filename = Join-Path $outputDir "${prefix}_${name}.png"
                 try {
                     Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
                     Write-Host "キャプチャ保存: $filename"
@@ -778,6 +817,7 @@ function Invoke-Capture {
         $ws.Dispose()
     }
     Write-Host "完了"
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -892,21 +932,36 @@ $script:RecorderJs = @'
     }
     push({type:"click", selector:cssPath(t), text:labelOf(t)});
   };
+  // テキスト系の入力欄か（チェックボックス等はクリックで記録、パスワードは記録ファイルに残さない）
+  function isTextField(el){
+    var tag=(el.tagName||"").toLowerCase();
+    if(tag==="textarea") return true;
+    if(tag!=="input") return false;
+    return !/^(checkbox|radio|file|submit|button|reset|image|range|color|password|hidden)$/i.test(el.type||"");
+  }
   var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
     if(tag==="select"){ push({type:"select", selector:cssPath(el), value:el.value}); }
-    else if(el.type==="checkbox"||el.type==="radio"){ /* クリックで記録済み */ }
-    else if(tag==="input"||tag==="textarea"){ push({type:"fill", selector:cssPath(el), value:el.value}); }
+    else if(isTextField(el)){ push({type:"fill", selector:cssPath(el), value:el.value}); }
+  };
+  // 入力中の値も拾う。サジェスト候補のクリックでは change がクリックより後になる／発火しないことがあり、
+  // 宛名番号の入力が記録から漏れるのを防ぐ（同じ欄の連続入力は記録側で最後の値にまとめる）。
+  var inputH = function(e){
+    var el=e.target;
+    if(isTextField(el)){ push({type:"fill", selector:cssPath(el), value:el.value}); }
   };
 
   // 古いハンドラがあれば除去して最新を付け直す。
   // これにより「ページを開いたまま録り直し」ても古いcssPath実装が残らない。
   try { if(window.__capClickH)  document.removeEventListener("click",  window.__capClickH,  true); } catch(e){}
   try { if(window.__capChangeH) document.removeEventListener("change", window.__capChangeH, true); } catch(e){}
+  try { if(window.__capInputH)  document.removeEventListener("input",  window.__capInputH,  true); } catch(e){}
   window.__capClickH = clickH;
   window.__capChangeH = changeH;
+  window.__capInputH = inputH;
   document.addEventListener("click",  clickH,  true);
   document.addEventListener("change", changeH, true);
+  document.addEventListener("input",  inputH,  true);
 })();
 '@
 
@@ -917,7 +972,7 @@ $script:DrainJs = @'
 
 # 記録した複数ページを、そのまま再生できる設定ファイルとして保存する（毎回上書き）
 function Save-RecordedConfig {
-    param($BaseCfg, $Pages, [string]$OutPath, [bool]$SpaMode = $false)
+    param($BaseCfg, $Pages, [string]$OutPath, [bool]$SpaMode = $false, [bool]$ClickNav = $false, [string]$KojinNo = "")
 
     $allPages = @($Pages)
 
@@ -932,9 +987,13 @@ function Save-RecordedConfig {
     }
     # SPA(認証付き等)を検出していれば spa_mode を有効にして保存（再生時にリロードせず遷移）
     if ($SpaMode -or $BaseCfg.spa_mode) { $out.spa_mode = $true }
+    # バッチ用の記録（宛名番号を差し替えて使い回す）
+    if ($ClickNav) { $out.click_nav = $true }
+    if ($KojinNo)  { $out.kojin_no = $KojinNo }
     # 待機設定を引き継ぐ（指定があれば）
-    if ($null -ne $BaseCfg.stable_ms)       { $out.stable_ms = [int]$BaseCfg.stable_ms }
-    if ($null -ne $BaseCfg.load_timeout_ms) { $out.load_timeout_ms = [int]$BaseCfg.load_timeout_ms }
+    if ($null -ne $BaseCfg.stable_ms)         { $out.stable_ms = [int]$BaseCfg.stable_ms }
+    if ($null -ne $BaseCfg.load_timeout_ms)   { $out.load_timeout_ms = [int]$BaseCfg.load_timeout_ms }
+    if ($null -ne $BaseCfg.action_timeout_ms) { $out.action_timeout_ms = [int]$BaseCfg.action_timeout_ms }
     if ($BaseCfg.ready_selector)            { $out.ready_selector = [string]$BaseCfg.ready_selector }
     if ($BaseCfg.viewport) { $out.viewport = $BaseCfg.viewport }
 
@@ -947,15 +1006,31 @@ function Save-RecordedConfig {
 
 # 1撮影ポイント=1ページを確定する。直前までの入力(pending)＋指定アクションを束ねる。
 function Add-RecPage {
-    param($Action, [bool]$Verbose)   # $Action: click/goto の ordered ハッシュ、または $null(入力のみ確定)
+    # $Action: click/goto の ordered ハッシュ、または $null(入力のみ確定)
+    # $Inputs: このページに入れる入力。省略時は保留中の入力(RecPending)を使って空にする
+    param($Action, [bool]$Verbose, $Inputs = $null)
     $acts = New-Object System.Collections.ArrayList
-    foreach ($p in $script:RecPending) { [void]$acts.Add($p) }
-    $script:RecPending.Clear()
+    if ($null -ne $Inputs) {
+        foreach ($p in $Inputs) { [void]$acts.Add($p) }
+    } else {
+        foreach ($p in $script:RecPending) { [void]$acts.Add($p) }
+        $script:RecPending.Clear()
+    }
     if ($Action) { [void]$acts.Add($Action) }
     if ($acts.Count -eq 0) { return }
     $script:RecIdx++
     $name = "{0}_{1:D3}" -f $script:RecPageName, $script:RecIdx
     [void]$script:RecPages.Add([ordered]@{ name = $name; actions = $acts })
+
+    # 確定した入力を覚えておく（入力欄の change が遅れて届いた時に二重記録しないため）
+    $inputs = @()
+    foreach ($a in $acts) {
+        if ($a.type -eq "fill" -or $a.type -eq "select") {
+            $script:RecEmittedInputs["$($a.selector)"] = [string]$a.value
+            $inputs += "$($a.selector)=$($a.value)"
+        }
+    }
+
     if ($Verbose) {
         $desc = if ($Action) {
             switch ($Action.type) {
@@ -964,6 +1039,7 @@ function Add-RecPage {
                 default { $Action.type }
             }
         } else { "(入力のみ)" }
+        if ($inputs.Count -gt 0) { $desc += "  [入力: $($inputs -join ', ')]" }
         Write-Host "  画面 $($script:RecPages.Count): $desc"
     }
 }
@@ -983,10 +1059,14 @@ function Add-RecordSample {
             #   → 遷移リンク/サジェスト等 → 宛先URLへの goto として確定（URLで確実に再現できる）
             # URLが変わらなければ
             #   → ページ内クリック(タブ/モーダル等) → click として確定（ボタン名で照合）
-            if ($script:RecPendingClick) { Add-RecPage -Action $script:RecPendingClick -Verbose $Verbose }
+            if ($script:RecPendingClick) { Resolve-PendingClick -Verbose $Verbose }
             $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
             if ($e.text) { $clickAct.text = [string]$e.text }
-            $script:RecPendingClick = $clickAct
+            # クリック時点までの入力をこのクリックに紐付ける（クリック後の入力と順序が混ざらないように）
+            $snap = New-Object System.Collections.ArrayList
+            foreach ($p in $script:RecPending) { [void]$snap.Add($p) }
+            $script:RecPending.Clear()
+            $script:RecPendingClick = @{ action = $clickAct; inputs = $snap }
             $script:RecClickArmed = 3
         }
         elseif ($e.type -eq "fill" -or $e.type -eq "select") {
@@ -996,9 +1076,17 @@ function Add-RecordSample {
             if ($prev -and $prev.type -eq $act.type -and $prev.selector -eq $act.selector) {
                 $script:RecPending[$script:RecPending.Count - 1] = $act
             } else {
+                # 既にページ/保留クリックに入った入力と同じ値が遅れて届いた（change の後着など）→ 二重記録しない
+                $key = "$($act.selector)"
+                $dupe = $script:RecEmittedInputs.ContainsKey($key) -and $script:RecEmittedInputs[$key] -eq [string]$act.value
+                if (-not $dupe -and $script:RecPendingClick) {
+                    foreach ($p in $script:RecPendingClick.inputs) {
+                        if ($p.selector -eq $act.selector -and [string]$p.value -eq [string]$act.value) { $dupe = $true; break }
+                    }
+                }
+                if ($dupe) { continue }
                 [void]$script:RecPending.Add($act)
             }
-            if ($Verbose) { Write-Host "    + 入力 $($act.selector) = $($act.value)" }
         }
     }
 
@@ -1011,9 +1099,21 @@ function Add-RecordSample {
             try { $sameOrigin = (([Uri]$url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$script:RecLastUrl).GetLeftPart([System.UriPartial]::Authority)) } catch {}
             if ($sameOrigin -and [int]$obj.load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
         }
-        # 遷移が起きた → 宛先URLへの goto を撮影ポイントに。
-        # （保留クリックがあればそれが起こした遷移なので、click は破棄し goto で確実に再現する）
-        Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose
+        if ($script:RecClickNav -and $script:RecPendingClick) {
+            # バッチ用記録(-ClickNav): 遷移を起こしたクリックを click のまま残す。
+            # 宛名番号を入力 → サジェスト候補をクリック、で遷移先が番号に応じて変わるようにする。
+            Resolve-PendingClick -Verbose $Verbose
+        } else {
+            # 遷移が起きた → 宛先URLへの goto を撮影ポイントに。
+            # （保留クリックがあればそれが起こした遷移なので、click は破棄し goto で確実に再現する。
+            #   クリックに紐付けていた入力は goto の前に入れる）
+            $pre = if ($script:RecPendingClick) { $script:RecPendingClick.inputs } else { $null }
+            if ($null -ne $pre) {
+                foreach ($p in $script:RecPending) { [void]$pre.Add($p) }
+                $script:RecPending.Clear()
+            }
+            Add-RecPage -Action ([ordered]@{ type = "goto"; url = $url }) -Verbose $Verbose -Inputs $pre
+        }
         $script:RecPendingClick = $null
         $script:RecClickArmed = 0
         $script:RecLastUrl = $url
@@ -1024,14 +1124,22 @@ function Add-RecordSample {
     if ($script:RecClickArmed -gt 0) {
         $script:RecClickArmed--
         if ($script:RecClickArmed -eq 0 -and $script:RecPendingClick) {
-            Add-RecPage -Action $script:RecPendingClick -Verbose $Verbose
-            $script:RecPendingClick = $null
+            Resolve-PendingClick -Verbose $Verbose
         }
     }
 }
 
+# 保留中のクリックを、紐付けた入力と一緒に click ページとして確定する
+function Resolve-PendingClick {
+    param([bool]$Verbose)
+    if (-not $script:RecPendingClick) { return }
+    $pc = $script:RecPendingClick
+    $script:RecPendingClick = $null
+    Add-RecPage -Action $pc.action -Inputs $pc.inputs -Verbose $Verbose
+}
+
 function Start-Recording {
-    param($Cfg, [string]$PageName, [string]$OutPath)
+    param($Cfg, [string]$PageName, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "")
 
     $baseUrl = if ($Cfg.cdp_url) { $Cfg.cdp_url } else { "http://localhost:9222" }
     $keyword = if ($Cfg.target_url_keyword) { $Cfg.target_url_keyword } else { "" }
@@ -1058,6 +1166,8 @@ function Start-Recording {
     $script:RecSawSpa      = $false  # SPAソフト遷移を1度でも検出したか
     $script:RecPageName    = $PageName
     $script:RecIdx         = 0
+    $script:RecClickNav    = $ClickNav  # バッチ用記録: URLが変わるクリックも click のまま残す
+    $script:RecEmittedInputs = @{}      # ページに確定済みの入力（セレクタ → 値）。後着 change の二重記録防止
     try {
         Invoke-CdpCommand -Ws $ws -Method "Page.enable" | Out-Null
         Invoke-CdpCommand -Ws $ws -Method "Runtime.enable" | Out-Null
@@ -1073,6 +1183,9 @@ function Start-Recording {
         Write-Host "=== 操作記録を開始しました ==="
         Write-Host "ブラウザを操作してください。クリック（ページ内タブ切替を含む）・画面遷移・入力を順に記録します。"
         Write-Host "各クリック／遷移ごとに1枚キャプチャする設定になります。"
+        if ($ClickNav) {
+            Write-Host "[バッチ用記録] 検索欄に宛名番号 $KojinNo を入力し、サジェスト候補をクリックして遷移してください。"
+        }
         Write-Host "記録を終了するには、このウィンドウで Enter キーを押してください。"
         Write-Host ""
 
@@ -1093,7 +1206,7 @@ function Start-Recording {
         try { $json = Invoke-PageScript -Ws $ws -Expression $script:DrainJs } catch { $json = $null }
         Add-RecordSample -Json $json -Verbose $false
         # 未解決の保留クリックはページ内クリックとして確定
-        if ($script:RecPendingClick) { Add-RecPage -Action $script:RecPendingClick -Verbose $false; $script:RecPendingClick = $null }
+        Resolve-PendingClick -Verbose $false
         Add-RecPage -Action $null -Verbose $false
     } finally {
         try {
@@ -1115,9 +1228,256 @@ function Start-Recording {
         return
     }
 
-    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath -SpaMode $script:RecSawSpa
+    # バッチ用記録: 指定した宛名番号が入力として記録されているか確認（無いとバッチで差し替えできない）
+    if ($KojinNo) {
+        $hits = Get-KojinNoHitCount -Pages $pages -KojinNo $KojinNo
+        if ($hits -eq 0) {
+            Write-Warning "記録内に宛名番号 '$KojinNo' の入力が見つかりません。このままではバッチで宛名番号を差し替えできません。"
+            Write-Warning "検索欄に宛名番号 '$KojinNo' をそのまま入力して記録し直してください。"
+        } else {
+            Write-Host "宛名番号 '$KojinNo' を記録内で $hits 箇所確認しました（バッチ実行時に差し替えます）。"
+        }
+    } elseif ($ClickNav) {
+        Write-Warning "-KojinNo が未指定です。バッチで使うには記録時の宛名番号を指定してください。"
+    }
+
+    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath -SpaMode $script:RecSawSpa -ClickNav $ClickNav -KojinNo $KojinNo
     Write-Host "保存先: $OutPath"
     Write-Host "再生(全画面キャプチャ): .\powershell\cdp_capture.ps1 -Config `"$OutPath`""
+}
+
+# ---------------------------------------------------------------------------
+# バッチ実行（別ツール出力の bat × 対応表 → 宛名番号を差し替えて全件キャプチャ）
+# ---------------------------------------------------------------------------
+
+# テキストファイルを文字コード自動判定で読む（UTF-8(BOM有/無) → 不正なら Shift_JIS(CP932)）
+# 別ツールが出力する bat は Shift_JIS のことが多いため。
+function Read-TextAuto {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).ProviderPath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)  # 不正なバイト列で例外
+        return $strictUtf8.GetString($bytes)
+    } catch {
+        return [System.Text.Encoding]::GetEncoding(932).GetString($bytes)
+    }
+}
+
+# "a/b/c" を分割する。前後の空白は除去し、末尾の "/" による空要素だけ取り除く
+# （途中の空要素は件数ズレを検出できるよう残す）
+function Split-BatList {
+    param([string]$Value)
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($s in ($Value -split '/')) { $list.Add($s.Trim()) }
+    while ($list.Count -gt 0 -and $list[$list.Count - 1] -eq '') { $list.RemoveAt($list.Count - 1) }
+    return ,$list.ToArray()
+}
+
+# bat を読み、チェック項目と宛名番号のペア一覧を返す。形式不正・件数不一致は例外
+function Read-BatPairs {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "batファイルが見つかりません: $Path" }
+    $vars = @{}
+    foreach ($line in ((Read-TextAuto -Path $Path) -split "`r?`n")) {
+        # set taisho_title=…  と  set "taisho_title=…"  の両方に対応
+        $m = [regex]::Match($line, '^\s*set\s+"?([A-Za-z_][A-Za-z0-9_]*)=(.*?)"?\s*$', 'IgnoreCase')
+        if ($m.Success) { $vars[$m.Groups[1].Value] = $m.Groups[2].Value }
+    }
+    if (-not $vars.ContainsKey("taisho_title"))   { throw "bat に set taisho_title=… の行がありません: $Path" }
+    if (-not $vars.ContainsKey("taisho_kojinNo")) { throw "bat に set taisho_kojinNo=… の行がありません: $Path" }
+
+    $titles = Split-BatList -Value $vars["taisho_title"]
+    $nos    = Split-BatList -Value $vars["taisho_kojinNo"]
+    if ($titles.Count -ne $nos.Count) {
+        throw "チェック項目と宛名番号の件数が一致しません（taisho_title=$($titles.Count)件 / taisho_kojinNo=$($nos.Count)件）。取り違え防止のため中止します。"
+    }
+    if ($titles.Count -eq 0) { throw "bat に対象が1件もありません: $Path" }
+
+    $pairs = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $titles.Count; $i++) {
+        [void]$pairs.Add([pscustomobject]@{ Title = $titles[$i]; KojinNo = $nos[$i] })
+    }
+    return ,$pairs
+}
+
+# 対応表を読む
+function Read-BatchMapping {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "対応表が見つかりません: $Path" }
+    try { $map = (Read-TextAuto -Path $Path) | ConvertFrom-Json }
+    catch { throw "対応表のJSONを読めません: $Path ($($_.Exception.Message))" }
+    if (-not $map.records) { throw "対応表に records（記録の論理名 → 記録ファイル）がありません: $Path" }
+    if (-not $map.items)   { throw "対応表に items（チェック項目 → 記録の論理名）がありません: $Path" }
+    return $map
+}
+
+# 対応表に書かれた記録ファイルのパスを解決する（作業フォルダ基準 → 対応表の場所基準の順）
+function Resolve-MappedPath {
+    param([string]$Path, [string]$MappingPath)
+    if (-not $Path) { return $null }
+    if (Test-Path -LiteralPath $Path) { return $Path }
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        $mapDir = Split-Path -Parent $MappingPath
+        if ($mapDir) {
+            $alt = Join-Path $mapDir $Path
+            if (Test-Path -LiteralPath $alt) { return $alt }
+        }
+    }
+    return $null
+}
+
+# 宛名番号を「前後が英数字でない位置」でだけ一致させる正規表現（11111 が 111112 の一部に当たらないように）
+function Get-KojinNoPattern {
+    param([string]$KojinNo)
+    return '(?<![0-9A-Za-z])' + [regex]::Escape($KojinNo) + '(?![0-9A-Za-z])'
+}
+
+# 記録内（入力値 と goto の URL）に宛名番号が何箇所あるか
+function Get-KojinNoHitCount {
+    param($Pages, [string]$KojinNo)
+    $pattern = Get-KojinNoPattern -KojinNo $KojinNo
+    $n = 0
+    foreach ($page in @($Pages)) {
+        foreach ($a in @($page.actions)) {
+            if ($a.type -eq "fill" -and $null -ne $a.value -and [regex]::IsMatch([string]$a.value, $pattern)) { $n++ }
+            elseif ($a.type -eq "goto" -and $a.url -and [regex]::IsMatch([string]$a.url, $pattern)) { $n++ }
+        }
+    }
+    return $n
+}
+
+# 記録内の宛名番号（入力値 と goto の URL）を差し替える。差し替えた箇所数を返す
+function Update-KojinNo {
+    param($Cfg, [string]$From, [string]$To)
+    $pattern = Get-KojinNoPattern -KojinNo $From
+    $replacement = $To.Replace('$', '$$')   # 置換文字列中の $ を文字として扱う
+    $n = 0
+    foreach ($page in @($Cfg.pages)) {
+        foreach ($a in @($page.actions)) {
+            if ($a.type -eq "fill" -and $null -ne $a.value -and [regex]::IsMatch([string]$a.value, $pattern)) {
+                $a.value = [regex]::Replace([string]$a.value, $pattern, $replacement); $n++
+            }
+            elseif ($a.type -eq "goto" -and $a.url -and [regex]::IsMatch([string]$a.url, $pattern)) {
+                $a.url = [regex]::Replace([string]$a.url, $pattern, $replacement); $n++
+            }
+        }
+    }
+    return $n
+}
+
+# フォルダ名・ファイル名に使えない文字を _ に置き換える
+function ConvertTo-SafeFileName {
+    param([string]$Name)
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Name.ToCharArray()) {
+        if ($invalid -contains $ch) { [void]$sb.Append('_') } else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString().Trim()
+}
+
+# バッチ本体。全件成功なら $true、スキップ/失敗が1件でもあれば $false
+function Invoke-Batch {
+    param([string]$BatFile, [string]$MappingPath, [string]$CdpUrl)
+
+    $pairs = Read-BatPairs -Path $BatFile
+    $map   = Read-BatchMapping -Path $MappingPath
+
+    $runTs   = Get-Date -Format "yyyyMMdd_HHmmss"
+    $outRoot = if ($map.output_dir) { [string]$map.output_dir } else { "output" }
+    $runDir  = Join-Path $outRoot "batch_$runTs"
+
+    Write-Host "=== バッチ実行 ==="
+    Write-Host "bat    : $BatFile"
+    Write-Host "対応表 : $MappingPath"
+    Write-Host "件数   : $($pairs.Count) 件"
+    Write-Host "出力先 : $runDir"
+
+    $done    = New-Object System.Collections.Generic.List[string]
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $failed  = New-Object System.Collections.Generic.List[string]
+
+    $idx = 0
+    foreach ($p in $pairs) {
+        $idx++
+        $label = "[$idx/$($pairs.Count)] $($p.Title) / 宛名番号 $($p.KojinNo)"
+        Write-Host ""
+        Write-Host "---- $label ----"
+
+        # 宛名番号・チェック項目の形式チェック
+        if (-not $p.KojinNo) { Write-Warning "スキップ: 宛名番号が空です"; $skipped.Add("$label : 宛名番号が空"); continue }
+        $seg = $p.Title -split '_'
+        if ($seg.Count -lt 2 -or -not $seg[0] -or -not $seg[1]) {
+            Write-Warning "スキップ: チェック項目が「大分類_小分類_…」の形式ではありません"
+            $skipped.Add("$label : チェック項目の形式不正"); continue
+        }
+        $dai = $seg[0]; $sho = $seg[1]
+
+        # 対応表: チェック項目 → 記録の論理名 → 記録ファイル
+        $itemProp = $map.items.PSObject.Properties[$p.Title]
+        if (-not $itemProp) {
+            Write-Warning "スキップ: 対応表の items にチェック項目が登録されていません"
+            $skipped.Add("$label : 対応表(items)に未登録"); continue
+        }
+        $recName = [string]$itemProp.Value
+        $recProp = $map.records.PSObject.Properties[$recName]
+        if (-not $recProp) {
+            Write-Warning "スキップ: 対応表の records に記録名 '$recName' が登録されていません"
+            $skipped.Add("$label : 対応表(records)に '$recName' が未登録"); continue
+        }
+        $recPath = Resolve-MappedPath -Path ([string]$recProp.Value) -MappingPath $MappingPath
+        if (-not $recPath) {
+            Write-Warning "スキップ: 記録ファイルが見つかりません: $($recProp.Value)"
+            $skipped.Add("$label : 記録ファイルなし ($($recProp.Value))"); continue
+        }
+
+        # 記録を件ごとに読み直す（前の件の差し替えが残らないように）
+        try { $cfg = (Read-TextAuto -Path $recPath) | ConvertFrom-Json }
+        catch {
+            Write-Warning "スキップ: 記録ファイルを読めません: $recPath"
+            $skipped.Add("$label : 記録ファイルを読めない"); continue
+        }
+        if (-not $cfg.kojin_no) {
+            Write-Warning "スキップ: 記録 '$recName' に kojin_no（記録時の宛名番号）がありません。-KojinNo を付けて記録し直してください"
+            $skipped.Add("$label : 記録に kojin_no がない"); continue
+        }
+
+        # 宛名番号の差し替え。1箇所も無ければ記録時の人を撮ってしまうのでスキップ
+        $n = Update-KojinNo -Cfg $cfg -From ([string]$cfg.kojin_no) -To $p.KojinNo
+        if ($n -eq 0) {
+            Write-Warning "スキップ: 記録 '$recName' の中に記録時の宛名番号 '$($cfg.kojin_no)' が見つからず、差し替えできません"
+            $skipped.Add("$label : 記録内に記録時の宛名番号なし"); continue
+        }
+        Write-Host "記録 '$recName' を使用（宛名番号 $($cfg.kojin_no) → $($p.KojinNo) を $n 箇所差し替え）"
+        if ($CdpUrl) { $cfg | Add-Member -NotePropertyName cdp_url -NotePropertyValue $CdpUrl -Force }
+
+        # 出力: {論理名}_{大分類} フォルダに {宛名番号}_{大分類}_{小分類}_{ページ名}.png
+        $folder = Join-Path $runDir (ConvertTo-SafeFileName "${recName}_${dai}")
+        $prefix = ConvertTo-SafeFileName "$($p.KojinNo)_${dai}_${sho}"
+
+        try {
+            $ok = @(Invoke-Capture -Cfg $cfg -OutDir $folder -FilePrefix $prefix)[-1]
+            if ($ok -eq $true) { $done.Add($label) }
+            else { $failed.Add("$label : 対象タブが見つからない") }
+        } catch {
+            Write-Warning "失敗: $($_.Exception.Message)"
+            $failed.Add("$label : $($_.Exception.Message)")
+        }
+    }
+
+    Write-Host ""
+    Write-Host "=== バッチ結果 ==="
+    Write-Host "成功   : $($done.Count) 件"
+    Write-Host "スキップ: $($skipped.Count) 件"
+    foreach ($s in $skipped) { Write-Host "  - $s" }
+    Write-Host "失敗   : $($failed.Count) 件"
+    foreach ($f in $failed) { Write-Host "  - $f" }
+    Write-Host "出力先 : $runDir"
+
+    return ($skipped.Count -eq 0 -and $failed.Count -eq 0)
 }
 
 # ---------------------------------------------------------------------------
@@ -1126,12 +1486,27 @@ function Start-Recording {
 if ($List) {
     $baseUrl = if ($CdpUrl) { $CdpUrl } else { "http://localhost:9222" }
     Show-Tabs -BaseUrl $baseUrl
+} elseif ($Batch) {
+    if (-not $BatFile) {
+        Write-Host "-BatFile で bat ファイルを指定してください" -ForegroundColor Red
+        exit 1
+    }
+    $allOk = $false
+    try {
+        $allOk = @(Invoke-Batch -BatFile $BatFile -MappingPath $Mapping -CdpUrl $CdpUrl)[-1]
+    } catch {
+        Write-Host "バッチを実行できません: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    # スキップ/失敗があれば非0で終了（GUIから起動した場合は結果を読めるようウィンドウが残る）
+    if ($allOk -ne $true) { exit 1 }
 } elseif ($Record) {
     $cfg = Get-CapConfig -Path $Config
     if ($CdpUrl) { $cfg.cdp_url = $CdpUrl }
-    Start-Recording -Cfg $cfg -PageName $Name -OutPath $OutConfig
+    Start-Recording -Cfg $cfg -PageName $Name -OutPath $OutConfig -ClickNav $ClickNav.IsPresent -KojinNo $KojinNo
 } else {
     $cfg = Get-CapConfig -Path $Config
     if ($CdpUrl) { $cfg.cdp_url = $CdpUrl }
-    Invoke-Capture -Cfg $cfg
+    $ok = @(Invoke-Capture -Cfg $cfg)[-1]
+    if ($ok -ne $true) { exit 1 }
 }

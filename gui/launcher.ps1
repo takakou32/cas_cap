@@ -45,7 +45,7 @@ function Start-InConsole {
 # ---------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "CAS Cap ランチャー"
-$form.Size = New-Object System.Drawing.Size(540, 470)
+$form.Size = New-Object System.Drawing.Size(540, 580)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -116,27 +116,33 @@ $gbCommon.Controls.Add($txtCdp)
 $gbMode = New-Object System.Windows.Forms.GroupBox
 $gbMode.Text = "3. 実行モード"
 $gbMode.Location = New-Object System.Drawing.Point(12, 178)
-$gbMode.Size = New-Object System.Drawing.Size(500, 110)
+$gbMode.Size = New-Object System.Drawing.Size(500, 218)
 $form.Controls.Add($gbMode)
 
 $rbNormal = New-Object System.Windows.Forms.RadioButton
 $rbNormal.Text = "通常キャプチャ"
 $rbNormal.Location = New-Object System.Drawing.Point(15, 22)
-$rbNormal.Size = New-Object System.Drawing.Size(130, 22)
+$rbNormal.Size = New-Object System.Drawing.Size(110, 22)
 $rbNormal.Checked = $true
 $gbMode.Controls.Add($rbNormal)
 
 $rbList = New-Object System.Windows.Forms.RadioButton
-$rbList.Text = "タブ一覧 (--list)"
-$rbList.Location = New-Object System.Drawing.Point(155, 22)
-$rbList.Size = New-Object System.Drawing.Size(140, 22)
+$rbList.Text = "タブ一覧"
+$rbList.Location = New-Object System.Drawing.Point(130, 22)
+$rbList.Size = New-Object System.Drawing.Size(95, 22)
 $gbMode.Controls.Add($rbList)
 
 $rbRecord = New-Object System.Windows.Forms.RadioButton
-$rbRecord.Text = "操作記録 (PSのみ)"
-$rbRecord.Location = New-Object System.Drawing.Point(305, 22)
-$rbRecord.Size = New-Object System.Drawing.Size(160, 22)
+$rbRecord.Text = "操作記録"
+$rbRecord.Location = New-Object System.Drawing.Point(230, 22)
+$rbRecord.Size = New-Object System.Drawing.Size(95, 22)
 $gbMode.Controls.Add($rbRecord)
+
+$rbBatch = New-Object System.Windows.Forms.RadioButton
+$rbBatch.Text = "バッチ実行"
+$rbBatch.Location = New-Object System.Drawing.Point(330, 22)
+$rbBatch.Size = New-Object System.Drawing.Size(110, 22)
+$gbMode.Controls.Add($rbBatch)
 
 $lblName = New-Object System.Windows.Forms.Label
 $lblName.Text = "記録名"
@@ -164,17 +170,79 @@ $txtOut.Size = New-Object System.Drawing.Size(235, 22)
 $txtOut.Enabled = $false
 $gbMode.Controls.Add($txtOut)
 
+# 記録オプション: バッチ用に記録（サジェスト遷移をクリックのまま残す）＋記録に使う宛名番号
+$chkClickNav = New-Object System.Windows.Forms.CheckBox
+$chkClickNav.Text = "バッチ用に記録"
+$chkClickNav.Location = New-Object System.Drawing.Point(15, 80)
+$chkClickNav.Size = New-Object System.Drawing.Size(120, 22)
+$chkClickNav.Enabled = $false
+$gbMode.Controls.Add($chkClickNav)
+
+$lblKojin = New-Object System.Windows.Forms.Label
+$lblKojin.Text = "記録に使う宛名番号"
+$lblKojin.Location = New-Object System.Drawing.Point(140, 83)
+$lblKojin.Size = New-Object System.Drawing.Size(115, 20)
+$gbMode.Controls.Add($lblKojin)
+
+$txtKojin = New-Object System.Windows.Forms.TextBox
+$txtKojin.Text = ""
+$txtKojin.Location = New-Object System.Drawing.Point(255, 80)
+$txtKojin.Size = New-Object System.Drawing.Size(140, 22)
+$txtKojin.Enabled = $false
+$gbMode.Controls.Add($txtKojin)
+
+# バッチ実行: 別ツールが出力した bat と、チェック項目→記録の対応表
+$lblBat = New-Object System.Windows.Forms.Label
+$lblBat.Text = "bat"
+$lblBat.Location = New-Object System.Drawing.Point(15, 113)
+$lblBat.Size = New-Object System.Drawing.Size(50, 20)
+$gbMode.Controls.Add($lblBat)
+
+$txtBat = New-Object System.Windows.Forms.TextBox
+$txtBat.Text = ""
+$txtBat.Location = New-Object System.Drawing.Point(65, 110)
+$txtBat.Size = New-Object System.Drawing.Size(330, 22)
+$txtBat.Enabled = $false
+$gbMode.Controls.Add($txtBat)
+
+$btnBat = New-Object System.Windows.Forms.Button
+$btnBat.Text = "参照..."
+$btnBat.Location = New-Object System.Drawing.Point(405, 109)
+$btnBat.Size = New-Object System.Drawing.Size(80, 24)
+$btnBat.Enabled = $false
+$gbMode.Controls.Add($btnBat)
+
+$lblMap = New-Object System.Windows.Forms.Label
+$lblMap.Text = "対応表"
+$lblMap.Location = New-Object System.Drawing.Point(15, 143)
+$lblMap.Size = New-Object System.Drawing.Size(50, 20)
+$gbMode.Controls.Add($lblMap)
+
+$txtMap = New-Object System.Windows.Forms.TextBox
+$txtMap.Text = "config/mapping.json"
+$txtMap.Location = New-Object System.Drawing.Point(65, 140)
+$txtMap.Size = New-Object System.Drawing.Size(330, 22)
+$txtMap.Enabled = $false
+$gbMode.Controls.Add($txtMap)
+
+$btnMap = New-Object System.Windows.Forms.Button
+$btnMap.Text = "参照..."
+$btnMap.Location = New-Object System.Drawing.Point(405, 139)
+$btnMap.Size = New-Object System.Drawing.Size(80, 24)
+$btnMap.Enabled = $false
+$gbMode.Controls.Add($btnMap)
+
 $lblModeHint = New-Object System.Windows.Forms.Label
-$lblModeHint.Text = "操作記録: 遷移した画面を順に記録。コンソールで Enter を押すと、各画面を撮る設定を出力先に保存。"
-$lblModeHint.Location = New-Object System.Drawing.Point(15, 80)
-$lblModeHint.Size = New-Object System.Drawing.Size(475, 20)
+$lblModeHint.Text = ""
+$lblModeHint.Location = New-Object System.Drawing.Point(15, 172)
+$lblModeHint.Size = New-Object System.Drawing.Size(475, 38)
 $lblModeHint.ForeColor = [System.Drawing.Color]::DimGray
 $gbMode.Controls.Add($lblModeHint)
 
 # --- 4. エンジン & 実行 ---------------------------------------------------
 $gbRun = New-Object System.Windows.Forms.GroupBox
 $gbRun.Text = "4. エンジン & 実行"
-$gbRun.Location = New-Object System.Drawing.Point(12, 296)
+$gbRun.Location = New-Object System.Drawing.Point(12, 404)
 $gbRun.Size = New-Object System.Drawing.Size(500, 70)
 $form.Controls.Add($gbRun)
 
@@ -199,7 +267,7 @@ $gbRun.Controls.Add($btnRun)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = ""
-$lblStatus.Location = New-Object System.Drawing.Point(12, 372)
+$lblStatus.Location = New-Object System.Drawing.Point(12, 480)
 $lblStatus.Size = New-Object System.Drawing.Size(500, 40)
 $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
 $form.Controls.Add($lblStatus)
@@ -208,14 +276,40 @@ $form.Controls.Add($lblStatus)
 # イベント
 # ---------------------------------------------------------------------------
 
-# 記録モードのときだけ 記録名/出力先 を有効化
-$updateRecordFields = {
-    $txtName.Enabled = $rbRecord.Checked
-    $txtOut.Enabled  = $rbRecord.Checked
+# PowerShell のコマンド文字列に埋め込む引数を単一引用符で囲む（$ や ` を展開させない）
+function ConvertTo-PsArg {
+    param([string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+# 選んだモードに応じて入力欄の有効/無効と説明を切り替える
+$updateModeFields = {
+    $isRec   = $rbRecord.Checked
+    $isBatch = $rbBatch.Checked
+    $txtName.Enabled     = $isRec
+    $txtOut.Enabled      = $isRec
+    $chkClickNav.Enabled = $isRec
+    $txtKojin.Enabled    = $isRec -and $chkClickNav.Checked
+    $txtBat.Enabled      = $isBatch
+    $btnBat.Enabled      = $isBatch
+    $txtMap.Enabled      = $isBatch
+    $btnMap.Enabled      = $isBatch
+    $lblModeHint.Text = if ($isBatch) {
+        "バッチ実行: bat のチェック項目×宛名番号ごとに、対応表の記録で全件を自動撮影します。事前に Edge 起動とアプリへのログインが必要です。"
+    } elseif ($isRec) {
+        "操作記録: 画面を順に記録し、Enter で出力先に保存。バッチ用は「バッチ用に記録」をオンにし、ここに入れた宛名番号を検索欄に入力して記録してください。"
+    } elseif ($rbList.Checked) {
+        "タブ一覧: 接続中の Edge のタブを表示します。"
+    } else {
+        "通常キャプチャ: Config の設定どおりに画面を撮影します。"
+    }
 }.GetNewClosure()
-$rbNormal.Add_CheckedChanged($updateRecordFields)
-$rbList.Add_CheckedChanged($updateRecordFields)
-$rbRecord.Add_CheckedChanged($updateRecordFields)
+$rbNormal.Add_CheckedChanged($updateModeFields)
+$rbList.Add_CheckedChanged($updateModeFields)
+$rbRecord.Add_CheckedChanged($updateModeFields)
+$rbBatch.Add_CheckedChanged($updateModeFields)
+$chkClickNav.Add_CheckedChanged($updateModeFields)
+& $updateModeFields
 
 # 設定ファイル参照
 $btnBrowse.Add_Click({
@@ -224,6 +318,26 @@ $btnBrowse.Add_Click({
     $dlg.InitialDirectory = Join-Path $RepoRoot "config"
     if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $txtConfig.Text = $dlg.FileName
+    }
+})
+
+# bat 参照
+$btnBat.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "バッチファイル (*.bat;*.cmd)|*.bat;*.cmd|すべて (*.*)|*.*"
+    $dlg.InitialDirectory = $RepoRoot
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtBat.Text = $dlg.FileName
+    }
+})
+
+# 対応表 参照
+$btnMap.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "JSON (*.json)|*.json|すべて (*.*)|*.*"
+    $dlg.InitialDirectory = Join-Path $RepoRoot "config"
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtMap.Text = $dlg.FileName
     }
 })
 
@@ -245,8 +359,8 @@ $btnRun.Add_Click({
 
     if ($rbJS.Checked) {
         # --- JavaScript版 ---
-        if ($rbRecord.Checked) {
-            [System.Windows.Forms.MessageBox]::Show("操作記録はPowerShell版のみ対応です。エンジンをPowerShellにしてください。", "未対応") | Out-Null
+        if ($rbRecord.Checked -or $rbBatch.Checked) {
+            [System.Windows.Forms.MessageBox]::Show("操作記録とバッチ実行はPowerShell版のみ対応です。エンジンをPowerShellにしてください。", "未対応") | Out-Null
             return
         }
         $a = "-c `"$cfg`""
@@ -257,18 +371,38 @@ $btnRun.Add_Click({
     }
     else {
         # --- PowerShell版 ---
-        $a = "-Config `"$cfg`""
-        if ($rbList.Checked) {
-            $a += " -List"
+        if ($rbBatch.Checked) {
+            $bat = $txtBat.Text.Trim()
+            $map = $txtMap.Text.Trim()
+            if (-not $bat) {
+                [System.Windows.Forms.MessageBox]::Show("bat ファイルを指定してください。", "入力エラー") | Out-Null
+                return
+            }
+            if (-not $map) { $map = "config/mapping.json" }
+            $a = "-Batch -BatFile $(ConvertTo-PsArg $bat) -Mapping $(ConvertTo-PsArg $map)"
         }
-        elseif ($rbRecord.Checked) {
-            $nm  = $txtName.Text.Trim()
-            $out = $txtOut.Text.Trim()
-            if (-not $nm)  { $nm = "recorded" }
-            if (-not $out) { $out = "config/recorded.json" }
-            $a += " -Record -Name `"$nm`" -OutConfig `"$out`""
+        else {
+            $a = "-Config $(ConvertTo-PsArg $cfg)"
+            if ($rbList.Checked) {
+                $a += " -List"
+            }
+            elseif ($rbRecord.Checked) {
+                $nm  = $txtName.Text.Trim()
+                $out = $txtOut.Text.Trim()
+                if (-not $nm)  { $nm = "recorded" }
+                if (-not $out) { $out = "config/recorded.json" }
+                $a += " -Record -Name $(ConvertTo-PsArg $nm) -OutConfig $(ConvertTo-PsArg $out)"
+                if ($chkClickNav.Checked) {
+                    $kno = $txtKojin.Text.Trim()
+                    if (-not $kno) {
+                        [System.Windows.Forms.MessageBox]::Show("バッチ用に記録する場合は、記録に使う宛名番号を入力してください。", "入力エラー") | Out-Null
+                        return
+                    }
+                    $a += " -ClickNav -KojinNo $(ConvertTo-PsArg $kno)"
+                }
+            }
         }
-        if ($cdp) { $a += " -CdpUrl `"$cdp`"" }
+        if ($cdp) { $a += " -CdpUrl $(ConvertTo-PsArg $cdp)" }
         Start-InConsole "& '.\powershell\cdp_capture.ps1' $a"
         $lblStatus.Text = "PS版を実行しました: $a"
     }

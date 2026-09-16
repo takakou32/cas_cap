@@ -81,7 +81,7 @@ Start-Process "msedge.exe" "--remote-debugging-port=9222"
 .\powershell\cdp_capture.ps1 -CdpUrl http://localhost:9333
 ```
 
-キャプチャ画像は `output/` に `{timestamp}_{name}.png`（巡回時）または `capture_{timestamp}.png`（単発時）形式で保存される。
+キャプチャ画像は `output/` に `{timestamp}_{name}.png`（巡回時）または `capture_{timestamp}.png`（単発時）形式で保存される（バッチ実行時は後述の形式）。
 
 ---
 
@@ -92,6 +92,14 @@ Start-Process "msedge.exe" "--remote-debugging-port=9222"
 | `-Config <path>` | `-c` | 設定ファイル(JSON)のパス | `config/config.json`    |
 | `-List`          |        | タブ一覧を表示して終了   | —                        |
 | `-CdpUrl <url>`  |        | CDPのURL（設定を上書き） | `http://localhost:9222` |
+| `-Record`        |        | 操作記録モード           | —                        |
+| `-Name <name>`   |        | （記録）ページ名の接頭辞 | `recorded`              |
+| `-OutConfig <path>` |     | （記録）保存先           | `config/recorded.json`  |
+| `-ClickNav`      |        | （記録）バッチ用に記録する。サジェスト候補の選択など、URLが変わるクリックも click のまま残す | — |
+| `-KojinNo <番号>` |       | （記録）記録に使った宛名番号。バッチ実行時にこの番号を差し替える | — |
+| `-Batch`         |        | バッチ実行モード         | —                        |
+| `-BatFile <path>` |       | （バッチ）別ツールが出力した bat | —                 |
+| `-Mapping <path>` |       | （バッチ）チェック項目と記録の対応表 | `config/mapping.json` |
 
 > PowerShellの引数はシングルダッシュ（`-List`）が基本。`--list` 形式は使えない点に注意。
 
@@ -152,6 +160,77 @@ Start-Process "msedge.exe" "--remote-debugging-port=9222"
 | `keyboard` | キー入力             | `key`（例 `"Enter"`）     | ページ内JSで`KeyboardEvent`発火             |
 
 > `click` / `fill` / `select` / `keyboard` はページ内JavaScript（`Runtime.evaluate`）経由で実行する。ネイティブのマウス/キー入力が必要な複雑なケースは [JavaScript版](../js/README.md)（Playwright）を推奨。
+
+---
+
+## バッチ実行（チェック項目 × 宛名番号の一括キャプチャ）
+
+別ツールが出力する bat のチェック項目と宛名番号の組ごとに、対応する操作記録を宛名番号だけ差し替えて再生し、全件を自動でキャプチャする。GUI（`gui\launcher.bat`）の「バッチ実行」からも実行できる。
+
+### 準備（チェック項目ごとに1回）
+
+1. 対象アプリを開いてログインしておく
+2. **検索欄に宛名番号を入力し、サジェスト候補をクリックして**確認画面を回る操作を、バッチ用として記録する
+
+   ```powershell
+   .\powershell\cdp_capture.ps1 -Record -ClickNav -KojinNo 11111 -OutConfig config/rec_inkan.json
+   ```
+
+   - `-KojinNo` には、記録で実際に入力した宛名番号を指定する（バッチ時にこの番号を差し替える）
+   - 記録の最後に「宛名番号 '11111' を記録内で N 箇所確認しました」と出れば OK。見つからない旨の警告が出たら記録し直す
+
+3. 対応表 `config/mapping.json` を作る（[サンプル](../config/mapping.sample.json)）
+
+   ```json
+   {
+     "output_dir": "output",
+     "records": { "印鑑": "config/rec_inkan.json" },
+     "items": {
+       "04_3_印鑑_最大文字調査_外国人併記名最大": "印鑑",
+       "04_7_印鑑_最大文字調査_外国人住所最大": "印鑑"
+     }
+   }
+   ```
+
+   - `records`：記録の論理名 → 記録ファイル
+   - `items`：チェック項目 → 記録の論理名
+
+### 実行（毎回）
+
+事前に Edge をデバッグポート付きで起動し、対象アプリにログインしておく（認証を保つためアプリはリロードしない）。
+
+```powershell
+.\powershell\cdp_capture.ps1 -Batch -BatFile .\list.bat -Mapping config/mapping.json
+```
+
+bat の形式（2行固定。`/` 区切りで、同じ位置同士が組になる。Shift_JIS / UTF-8 どちらでも可）:
+
+```bat
+set taisho_title=04_3_印鑑_最大文字調査_外国人併記名最大/04_7_印鑑_最大文字調査_外国人住所最大
+set taisho_kojinNo=11111/222222
+```
+
+### 出力
+
+```
+output\batch_{実行日時}\{記録の論理名}_{大分類}\{宛名番号}_{大分類}_{小分類}_{ページ名}.png
+```
+
+例: `output\batch_20260916_153000\印鑑_04\222222_04_7_recorded_002.png`
+
+大分類・小分類はチェック項目の先頭2つ（`04_7_…` → `04` と `7`）。
+
+### 止まる／飛ばすケース
+
+| 状況 | 動作 |
+| ---- | ---- |
+| チェック項目と宛名番号の件数が違う | 全体を中止（取り違え防止） |
+| 対応表に無いチェック項目／記録ファイルが無い | その件を飛ばして次へ |
+| チェック項目が `大分類_小分類_…` の形でない | その件を飛ばして次へ |
+| 記録に `kojin_no` が無い／記録内に記録時の宛名番号が無い | その件を飛ばして次へ（別人を撮らないため） |
+| 途中で失敗 | 次の件へ進む |
+
+最後に成功・スキップ・失敗の件数と理由を表示する。スキップ／失敗が1件でもあれば終了コード 1（GUI から起動した場合は結果を読めるようウィンドウが残る）。
 
 ---
 

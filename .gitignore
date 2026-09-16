@@ -18,6 +18,8 @@ config/config.json
 # Output
 output/*.png
 output/*.jpg
+# バッチ実行の出力（宛名番号ごとの画面キャプチャ。個人情報を含むため含めない）
+output/batch_*/
 
 # IDE
 .vscode/

@@ -24,6 +24,14 @@
   .spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #ccc; border-top-color: #2d4a6e; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .preview { border: 2px solid #2d4a6e; padding: 24px; background: #fffbe6; }
+  .fields { margin: 12px 0; }
+  .field { margin: 4px 0; }
+  .field label { display: inline-block; width: 80px; }
+  .p-input-icon-right { position: relative; display: inline-block; }
+  .p-input-icon-right input { width: 240px; padding: 4px 24px 4px 4px; }
+  .p-input-icon-right .icons { position: absolute; right: 6px; top: 6px; width: 14px; height: 14px; cursor: pointer; }
+  .pi-search-plus::before { content: "🔍"; font-size: 12px; font-style: normal; }
+  .zoom { border: 1px solid #2d4a6e; padding: 8px; margin-top: 8px; background: #eef4fb; }
 </style>
 </head>
 <body>
@@ -35,7 +43,9 @@
     2. 「検索」ボタンで対象者一覧を出す。一覧は前方一致（11111 で 111119 も出る）。行は tr.p-selectable-row
        URL は変えない（業務システムのポストバックを模す）
     3. 行をクリックすると詳細へ。URL には宛名番号ではなく世帯番号と内部キーが入る
-    4. 詳細の「帳票」タブを押すと帳票プレビューの作成が始まり、約3秒「くるくる」が出る。くるくるは回るだけで
+    4. 詳細には項目欄（住所・本籍など）があり、欄の右の虫眼鏡アイコン（文字なし）で拡大表示する。
+       欄の数は人によって違う（外国人は併記名が前に増える／本籍しかない人もいる）
+    5. 詳細の「帳票」タブを押すと帳票プレビューの作成が始まり、約3秒「くるくる」が出る。くるくるは回るだけで
        画面の中身（DOM）を変えない。作成中はメニュー（宛名検索）を押しても効かない
   ?label=name を付けると、一覧・候補の表示が氏名だけ（宛名番号なし）になる。
   画面の動きは window.__mockLog に積まれる（検証用）。
@@ -46,10 +56,10 @@
 (function () {
   var labelMode = new URLSearchParams(location.search).get('label') === 'name' ? 'name' : 'number';
   var PEOPLE = [
-    { atena: '11111',  name: '山田 太郎', setai: '90001', key: 'k7f3' },
-    { atena: '111119', name: '田中 次郎', setai: '90004', key: 'k1a9' },
-    { atena: '222222', name: '佐藤 花子', setai: '90002', key: 'k5c2' },
-    { atena: '333333', name: '鈴木 一郎', setai: '90003', key: 'k9d8' }
+    { atena: '11111',  name: '山田 太郎', setai: '90001', key: 'k7f3', fields: { '住所': '東京都', '本籍': '大阪府' } },
+    { atena: '111119', name: '田中 次郎', setai: '90004', key: 'k1a9', fields: { '併記名': 'JIRO TANAKA', '住所': '京都府', '本籍': '兵庫県' } },
+    { atena: '222222', name: '佐藤 花子', setai: '90002', key: 'k5c2', fields: { '本籍': '福岡県' } },
+    { atena: '333333', name: '鈴木 一郎', setai: '90003', key: 'k9d8', fields: { '住所': '北海道', '本籍': '青森県' } }
   ];
   window.__mockLog = [];
   var busy = false;
@@ -77,7 +87,26 @@
         '<section class="detail"><h2>宛名詳細</h2>' +
         '<p class="person">宛名番号 <span class="atena">' + p.atena + '</span> ／ 氏名 <span class="name">' + p.name + '</span></p>' +
         '<div class="tabs"><div class="tab" data-tab="基本">基本</div><div class="tab" data-tab="履歴">履歴</div><div class="tab" data-tab="世帯">世帯</div><div class="tab" data-tab="帳票">帳票</div></div>' +
+        '<div class="fields"></div>' +
         '<div class="tab-body">基本: ' + p.name + '</div></section>';
+      // 項目欄。人によって欄の数が違う（外国人は併記名が前に増える／本籍しかない人もいる）。
+      // 虫眼鏡アイコンは文字が無く、欄の位置で指すと人によってずれる
+      var fbox = view.querySelector('.fields');
+      Object.keys(p.fields).forEach(function (label) {
+        var fid = rid() + '_f';
+        var div = document.createElement('div');
+        div.className = 'field';
+        div.innerHTML = '<label for="' + fid + '">' + label + '</label> ' +
+          '<span class="p-input-icon-right"><input id="' + fid + '" readonly><i data-v-22e9768b class="pi pi-search-plus icon-base-700 icons"></i></span>';
+        div.querySelector('input').value = p.fields[label];
+        div.querySelector('i').addEventListener('click', function () {
+          var z = fbox.querySelector('.zoom') || fbox.appendChild(document.createElement('div'));
+          z.className = 'zoom';
+          z.textContent = '拡大表示: ' + label + ' = ' + p.fields[label];
+          window.__mockLog.push({ view: 'zoom', atena: p.atena, field: label });
+        });
+        fbox.appendChild(div);
+      });
       window.__mockLog.push({ view: 'detail', atena: p.atena });
       Array.prototype.forEach.call(view.querySelectorAll('.tab'), function (t) {
         t.addEventListener('click', function () {

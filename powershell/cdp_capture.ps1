@@ -262,6 +262,30 @@ new Promise((resolve) => {
 }
 
 # ---------------------------------------------------------------------------
+# 近くの見出し（JS）… 記録（RecorderJs）と再生（クリック）で共通
+# ---------------------------------------------------------------------------
+$script:NearLabelJs = @'
+  // 文字の無い要素（入力欄の横の虫眼鏡アイコン等）が「どの欄のものか」の目印。
+  // 近くにある label 要素の文字を使う（入力値は人ごとに変わるので使わない）。記録と再生で同じ関数を使うこと
+  function nearLabel(el){
+    var n = el;
+    for (var hop = 0; n && n !== document.body && hop < 6; hop++, n = n.parentElement) {
+      if (!n.querySelector) continue;
+      var inp = n.querySelector('input[id],textarea[id],select[id]');
+      if (inp) {
+        var lf = null; try { lf = document.querySelector('label[for="' + CSS.escape(inp.id) + '"]'); } catch(_){}
+        var t1 = lf ? (lf.innerText || lf.textContent || '').trim() : '';
+        if (t1) return t1.slice(0, 40);
+      }
+      var lb = n.querySelector('label');
+      var t2 = lb ? (lb.innerText || lb.textContent || '').trim() : '';
+      if (t2) return t2.slice(0, 40);
+    }
+    return '';
+  }
+'@
+
+# ---------------------------------------------------------------------------
 # クリックの共通部品（JS）… cas_auto_report と同じもの
 #   通常のクリックと「位置で押す(by_index)」で押し方を同じにするため、ここに1本化してある。
 #   resolve は埋め込み先の Promise のものを使う。
@@ -356,14 +380,18 @@ function Invoke-CapAction {
             # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
             # ボタン名に宛名番号が入っていたクリック（match_kojin_no あり。検索結果の行など）は、
             # 宛名番号だけで照合する（氏名は人ごとに違うため）。前後が英数字の所は一致とみなさない（11111 と 111119 を区別）。
+            # ボタン名が無いクリック（虫眼鏡アイコン等）は、人によって欄の数が違うとセレクタの位置がずれるので、
+            # 近くの見出し（near_text）で同じ欄のものを探す。候補が2つ以上なら押さずに失敗する。
             $sel = ConvertTo-JsLiteral $Action.selector
             $txt = ConvertTo-JsLiteral ([string]$Action.text)
             $no  = ConvertTo-JsLiteral $(if ($Action.match_kojin_no) { [string]$Action.match_kojin_no } else { "" })
+            $near = ConvertTo-JsLiteral ([string]$Action.near_text)
             $to  = $script:ActionTimeoutMs
             $expr = @"
 new Promise((resolve) => {
-  const sel = $sel, text = $txt, no = $no, deadline = Date.now() + $to;
+  const sel = $sel, text = $txt, no = $no, near = $near, deadline = Date.now() + $to;
 $($script:ClickHelpersJs)
+$($script:NearLabelJs)
   function txtOf(e){
     var s=(e.innerText||e.textContent||'').trim();
     if(!s){ try { s=((e.getAttribute('aria-label')||e.getAttribute('title'))||'').trim(); } catch(_){} }
@@ -390,30 +418,75 @@ $($script:ClickHelpersJs)
     return list.find(function(e){ return txtOf(e) === text; })
         || list.find(function(e){ return matches(txtOf(e), text); });
   }
+  function all(q){ try { return Array.prototype.slice.call(document.querySelectorAll(q)).filter(visible); } catch(e){ return []; } }
+  function uniqEls(l){ return l.filter(function(e, i){ return l.indexOf(e) === i; }); }
+  // 記録したセレクタから位置の番号を外したもの、と、最後の要素だけ（例 i.pi.pi-search-plus.icons）で広く探す
+  function wide(){
+    var bare = sel.replace(/:nth-of-type\(\d+\)/g, '');
+    var last = bare.split(' > ').pop();
+    return uniqEls(all(bare).concat(all(last)));
+  }
+  // ボタン名が無いクリックの対象を決める。{el,how} / {multi:件数} / null(まだ無い)
+  function pickNoText(){
+    var list = all(sel);
+    if (near) {
+      // 見出しが記録されていれば、見出しが同じものだけを候補にする（位置が合っていても見出しが違えば押さない）
+      var hit = uniqEls(list.concat(wide())).filter(function(e){ return nearLabel(e) === near; });
+      if (hit.length === 1) return { el: hit[0], how: (list.indexOf(hit[0]) >= 0 ? 'clicked-notext' : 'near') };
+      if (hit.length > 1) return { multi: hit.length };
+      return null;
+    }
+    // 見出しが無い（以前の記録・近くに見出しが無い）→ 記録したセレクタで見えている最初のもの
+    if (list.length) return { el: list[0], how: 'clicked-notext' };
+    // それも無ければ、同じ種類の要素が画面にちょうど1つのときだけ押す
+    var w = wide();
+    if (w.length === 1) return { el: w[0], how: 'wide' };
+    if (w.length > 1) return { multi: w.length };
+    return null;
+  }
+  var lastMulti = 0;
   (function check(){
+    if (!text) {
+      var r = pickNoText();
+      if (r && r.el) return go(r.el, r.how);
+      // 候補が複数でも、描画途中かもしれないので時間切れまで待ってから失敗にする
+      lastMulti = (r && r.multi) ? r.multi : 0;
+      if (Date.now() > deadline) return resolve(lastMulti ? ('multi:' + lastMulti) : 'notfound');
+      return setTimeout(check, 150);
+    }
     var el = null; try { el = document.querySelector(sel); } catch(e){}
     // 1) セレクタが当たり、かつ(テキスト未記録 or ラベル一致) → それをクリック
     if (visible(el) && (!text || matches(txtOf(el), text))) return go(el, 'clicked');
     // 2) ラベル一致の要素を探す（順番が変わっても“ボタン名”で当てる）
     var c = byText();
     if (c) return go(c, 'text');
-    // 3) テキスト情報が無い時（アイコン等）は位置一致のセレクタ要素をクリック
-    if (visible(el) && !text) return go(el, 'clicked-notext');
-    // 4) テキストはあるが一致要素が無い → まだ描画中かもしれないので待つ
+    // 3) テキストはあるが一致要素が無い → まだ描画中かもしれないので待つ
     if (Date.now() > deadline) return resolve('notfound');
     setTimeout(check, 150);
   })();
 })
 "@
-            $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
+            $st = "" + (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true)
+            $nearDesc = if ($Action.near_text) { " (見出し: $($Action.near_text))" } else { "" }
+            if ($st -like 'multi:*') {
+                $msg = "クリック対象の候補が$($st.Substring(6))件あり、1つに決められません: $($Action.selector)$nearDesc"
+                if ($script:BatchMode) { throw $msg }
+                Write-Warning "$msg(スキップ)"
+                break
+            }
             switch ($st) {
                 'notfound' {
                     # バッチ実行ではその件を打ち切る（ずれた画面のまま進んで別の人を撮らないため）
-                    if ($script:BatchMode) { throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))" }
+                    if ($script:BatchMode) {
+                        if (-not $Action.text) { throw "クリック対象が見つかりません: $($Action.selector)$nearDesc" }
+                        throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))"
+                    }
                     Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)"
                 }
                 'text'           { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
-                'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector))" }
+                'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector)$nearDesc)" }
+                'near'           { Write-Host "  (見出しが同じ要素をクリック: $($Action.near_text)。記録した位置とは違う場所)" }
+                'wide'           { Write-Host "  (同じ種類の要素が1つだけなのでクリック: $($Action.selector))" }
             }
         }
         "fill" {
@@ -1065,11 +1138,15 @@ $script:RecorderJs = @'
     return !/^(checkbox|radio|file|submit|button|reset|image|range|color|password|hidden)$/i.test(el.type||"");
   }
   // cas_auto_report と同じ拾い方：クリックは「実際にクリックが届いた要素」で記録する
+/*__NEAR_LABEL__*/
   var clickH = function(e){
     var t=clickTarget(e.target);
     if(!t || isTypingTarget(t)) return;
     var cs=cssPath(t);
-    push({type:"click", selector:cs, text:labelOf(t), idx:idxOf(cs,t)});
+    var ev={type:"click", selector:cs, text:labelOf(t), idx:idxOf(cs,t)};
+    // ボタン名が無いクリックは、再生時に位置がずれても探せるよう近くの見出しを残す
+    if(!ev.text){ ev.near=nearLabel(t); }
+    push(ev);
   };
   // 入力は確定した値（change）で記録する。検索ボタンを押すと欄を離れるので、クリックより先に届く
   var changeH = function(e){
@@ -1094,6 +1171,8 @@ $script:RecorderJs = @'
   document.addEventListener("change", changeH, true);
 })();
 '@
+# 近くの見出しを求める関数は再生側と共通（同じ関数で求めた値どうしを比べるため）
+$script:RecorderJs = $script:RecorderJs.Replace('/*__NEAR_LABEL__*/', $script:NearLabelJs)
 
 # 現在のURLと、溜まった入力イベントをまとめて回収してバッファをクリアするJS
 $script:DrainJs = @'
@@ -1193,6 +1272,7 @@ function Add-RecordSample {
             if ($script:RecPendingClick) { Resolve-PendingClick -Verbose $Verbose }
             $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
             if ($e.text) { $clickAct.text = [string]$e.text }
+            elseif ($e.near) { $clickAct.near_text = [string]$e.near }   # 文字の無い要素の、近くの見出し
             if ($null -ne $e.idx) { $clickAct._idx = [int]$e.idx }   # 位置で押す用（保存前に消す）
             # クリック時点までの入力をこのクリックに紐付ける（クリック後の入力と順序が混ざらないように）
             $snap = New-Object System.Collections.ArrayList
@@ -1308,6 +1388,7 @@ function Get-RecActionDesc {
         "click" {
             if ($Action.by_index) { return "click $($Action.selector) (位置で押す)" }
             if ($Action.text) { return "click $($Action.selector) ($($Action.text))" }
+            if ($Action.near_text) { return "click $($Action.selector) [見出し: $($Action.near_text)]" }
             return "click $($Action.selector)"
         }
         "fill"   { return "fill $($Action.selector) = $($Action.value)" }

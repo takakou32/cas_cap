@@ -1819,11 +1819,11 @@ function Invoke-Batch {
         # 操作後の待ち時間は対応表の値を優先（記録を録り直さずに調整できるように）
         if ($null -ne $map.wait_after_ms) { $cfg | Add-Member -NotePropertyName wait_after_ms -NotePropertyValue ([int]$map.wait_after_ms) -Force }
 
-        # 出力: {論理名}_{大分類} フォルダに {宛名番号}_{大分類}_{小分類}_{ページ名}.png
-        $folder = Join-Path $runDir (ConvertTo-SafeFileName "${recName}_${dai}")
+        # 出力: {チェック項目} フォルダに {宛名番号}_{大分類}_{小分類}_{ページ名}.png
+        $folder = Join-Path $runDir (ConvertTo-SafeFileName $p.Title)
         $prefix = ConvertTo-SafeFileName "$($p.KojinNo)_${dai}_${sho}"
 
-        # バッチ実行中は本物のマウス・キー入力で操作し、合わなければその件を打ち切る
+        # バッチ実行中は、対象が見つからなければスキップせずその件を打ち切る
         $script:BatchMode = $true
         $itemOk = $false
         try {

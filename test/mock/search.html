@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>練習ページ: 宛名番号サジェスト</title>
+<title>練習ページ: 宛名検索</title>
 <style>
   body { font-family: "Meiryo", sans-serif; margin: 0; }
   .app-header { background: #2d4a6e; padding: 8px 16px; }
@@ -13,7 +13,11 @@
   .suggest-overlay ul { list-style: none; margin: 0; padding: 0; }
   .suggest-option { padding: 4px 8px; cursor: pointer; }
   .suggest-option:hover { background: #dde8f5; }
-  .empty { padding: 4px 8px; color: #888; }
+  .p-datatable { border-collapse: collapse; margin-top: 12px; }
+  .p-datatable td, .p-datatable th { border: 1px solid #ccc; padding: 4px 12px; }
+  .p-selectable-row { cursor: pointer; }
+  .p-selectable-row:hover, .p-selectable-row.p-highlight { background: #dde8f5; }
+  .empty { color: #888; }
   .tabs { display: flex; gap: 4px; margin: 12px 0; }
   .tab { border: 1px solid #999; padding: 4px 12px; cursor: pointer; }
   .tab-body { border: 1px solid #ccc; padding: 12px; }
@@ -24,16 +28,16 @@
 </head>
 <body>
 <!--
-  cas_cap のバッチ用記録（宛名番号を入力 → サジェスト候補を選択）を検証するための練習ページ。
-  実在システムの値は使っていない。業務システムで見られる次のくせを再現している。
-    1. 検索はキーを離した時（keyup）だけ動く。プログラムから input イベントを投げても候補は出ない
-    2. 候補はマウスを押した瞬間（mousedown）に選ばれ、その時点で候補リストが消える（click は候補に届かない）
-    3. 候補リストは body 直下の別レイヤーに描かれ、前に入る要素の数やIDが毎回変わる
-    4. 候補を選ぶと、表示名を入力欄へ書き戻して change を発火する
-    5. 選択後、少し遅れて画面が変わる。URL には宛名番号ではなく世帯番号と内部キーが入る
-    6. 「帳票」タブを押すと帳票プレビューの作成が始まり、約3秒「くるくる」が出る。くるくるは回るだけで
+  cas_cap のバッチ用記録（宛名番号を入力 → 検索 → 対象者一覧の行を選択）を検証するための練習ページ。
+  実在システムの値は使っていない。業務システムで見られる次の作りを再現している。
+    1. 宛名番号をキー入力すると、少し遅れてサジェスト（候補）が出る（キーを離した時だけ動く）。
+       候補を選ぶと一覧を飛ばして詳細へ進む。候補の外をクリックすると閉じる
+    2. 「検索」ボタンで対象者一覧を出す。一覧は前方一致（11111 で 111119 も出る）。行は tr.p-selectable-row
+       URL は変えない（業務システムのポストバックを模す）
+    3. 行をクリックすると詳細へ。URL には宛名番号ではなく世帯番号と内部キーが入る
+    4. 詳細の「帳票」タブを押すと帳票プレビューの作成が始まり、約3秒「くるくる」が出る。くるくるは回るだけで
        画面の中身（DOM）を変えない。作成中はメニュー（宛名検索）を押しても効かない
-  ?label=name を付けると、候補の表示名が氏名だけ（宛名番号なし）になる。
+  ?label=name を付けると、一覧・候補の表示が氏名だけ（宛名番号なし）になる。
   画面の動きは window.__mockLog に積まれる（検証用）。
 -->
 <header class="app-header"><a href="#/search" class="nav-link">宛名検索</a></header>
@@ -53,9 +57,11 @@
 
   function rid() { return 'pv_id_' + Math.floor(Math.random() * 1000); }
   function labelOf(p) { return labelMode === 'name' ? p.name : (p.atena + ' ' + p.name); }
-  function closeOverlay() {
-    if (overlay) { overlay.remove(); overlay = null; }
-    Array.prototype.forEach.call(document.querySelectorAll('.overlay-spacer'), function (d) { d.remove(); });
+  function hits(v) { return PEOPLE.filter(function (p) { return p.atena.indexOf(v) === 0; }); }
+  function closeOverlay() { if (overlay) { overlay.remove(); overlay = null; } }
+  function openDetail(p) {
+    // 少し遅れて遷移。URL には世帯番号と内部キー
+    setTimeout(function () { location.hash = '#/detail?setai=' + p.setai + '&k=' + p.key; }, 300);
   }
 
   function render() {
@@ -86,66 +92,90 @@
     var id = rid();
     view.innerHTML =
       '<section class="search"><h2>宛名検索</h2>' +
-      '<label for="' + id + '_input">宛名番号</label> <input id="' + id + '_input" class="atena-input" autocomplete="off"></section>';
+      '<label for="' + id + '_input">宛名番号</label> <input id="' + id + '_input" class="atena-input" autocomplete="off"> ' +
+      '<button type="button" class="p-button search-button" aria-label="検索">検索</button>' +
+      '<div class="result"></div></section>';
     var input = view.querySelector('.atena-input');
-    // くせ1: キーを離した時だけ検索する
+    // サジェスト: キーを離した時だけ、少し遅れて出る
     input.addEventListener('keyup', function () {
       clearTimeout(timer);
       var v = input.value.trim();
       if (!v) { closeOverlay(); return; }
-      timer = setTimeout(function () { search(input, v); }, 300);
+      timer = setTimeout(function () { suggest(input, v); }, 300);
     });
+    view.querySelector('.search-button').addEventListener('click', function () { search(view, input.value.trim()); });
   }
 
-  function search(input, v) {
+  function suggest(input, v) {
     setTimeout(function () {                       // サーバ問い合わせの代わり
-      if (input.value.trim() !== v) return;
-      var hits = PEOPLE.filter(function (p) { return p.atena.indexOf(v) === 0; });
+      if (input.value.trim() !== v || !document.body.contains(input)) return;
+      var list = hits(v);
       closeOverlay();
-      // くせ3: 前に入る要素の数が毎回変わる（位置の指定がずれる）
-      var n = Math.floor(Math.random() * 3);
-      for (var i = 0; i < n; i++) {
-        var d = document.createElement('div'); d.className = 'overlay-spacer'; document.body.appendChild(d);
-      }
+      if (!list.length) return;
       overlay = document.createElement('div');
       overlay.className = 'suggest-overlay';
       overlay.id = rid() + '_list';
       var r = input.getBoundingClientRect();
       overlay.style.left = (r.left + window.scrollX) + 'px';
       overlay.style.top = (r.bottom + window.scrollY) + 'px';
-      if (!hits.length) {
-        overlay.innerHTML = '<div class="empty">該当なし</div>';
-        document.body.appendChild(overlay);
-        return;
-      }
       var ul = document.createElement('ul');
       ul.setAttribute('role', 'listbox');
-      hits.forEach(function (p, idx) {
+      list.forEach(function (p, idx) {
         var li = document.createElement('li');
         li.setAttribute('role', 'option');
         li.className = 'suggest-option';
         li.id = overlay.id + '_' + idx;
         li.textContent = labelOf(p);
-        // くせ2: マウスを押した瞬間に選ぶ
-        li.addEventListener('mousedown', function (e) { e.preventDefault(); choose(input, p); });
+        li.addEventListener('click', function () {
+          input.value = labelOf(p);
+          closeOverlay();
+          window.__mockLog.push({ view: 'suggest-pick', atena: p.atena });
+          openDetail(p);
+        });
         ul.appendChild(li);
       });
       overlay.appendChild(ul);
       document.body.appendChild(overlay);
     }, 400);
   }
+  // 候補の外をクリックしたら閉じる
+  document.addEventListener('mousedown', function (e) {
+    if (overlay && !overlay.contains(e.target)) closeOverlay();
+  }, true);
 
-  function choose(input, p) {
-    // くせ4: 表示名を入力欄へ書き戻して change を発火
-    input.value = labelOf(p);
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+  function search(view, v) {
     closeOverlay();
-    window.__mockLog.push({ view: 'select', atena: p.atena });
-    // くせ5: 少し遅れて遷移。URL には世帯番号と内部キー
-    setTimeout(function () { location.hash = '#/detail?setai=' + p.setai + '&k=' + p.key; }, 500);
+    var box = view.querySelector('.result');
+    box.innerHTML = '<p class="empty">検索中…</p>';
+    setTimeout(function () {                       // サーバ問い合わせの代わり
+      var list = v ? hits(v) : [];
+      window.__mockLog.push({ view: 'list', query: v, count: list.length });
+      if (!list.length) { box.innerHTML = '<p class="empty">該当する対象者はいません</p>'; return; }
+      var table = document.createElement('table');
+      table.className = 'p-datatable';
+      table.innerHTML = '<thead><tr><th>' + (labelMode === 'name' ? '氏名' : '宛名番号・氏名') + '</th></tr></thead>';
+      var tbody = document.createElement('tbody');
+      list.forEach(function (p) {
+        var tr = document.createElement('tr');
+        tr.className = 'p-selectable-row';
+        tr.setAttribute('tabindex', '0');
+        var td = document.createElement('td');
+        td.textContent = labelOf(p);
+        tr.appendChild(td);
+        tr.addEventListener('click', function () {
+          tr.classList.add('p-highlight');
+          window.__mockLog.push({ view: 'select', atena: p.atena });
+          openDetail(p);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      box.innerHTML = '';
+      box.appendChild(table);
+    }, 500);
   }
 
-  // くせ6: 帳票プレビューの作成。くるくるを出したら、完成までDOMは変えない
+  // 帳票プレビューの作成。くるくるを出したら、完成までDOMは変えない
   function startPreview(view, p) {
     var body = view.querySelector('.tab-body');
     busy = true;
@@ -160,7 +190,9 @@
   }
   // 作成中はメニューを押しても効かない
   document.querySelector('.nav-link').addEventListener('click', function (e) {
-    if (busy) { e.preventDefault(); window.__mockLog.push({ view: 'ignored' }); }
+    if (busy) { e.preventDefault(); window.__mockLog.push({ view: 'ignored' }); return; }
+    // 検索画面にいる時に押しても、画面を初期状態に戻す（URLが同じでも描き直す）
+    if ((location.hash || '#/search') === '#/search') { e.preventDefault(); render(); }
   });
 
   window.addEventListener('hashchange', render);

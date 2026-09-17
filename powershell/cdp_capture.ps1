@@ -25,7 +25,7 @@
     操作記録モード。ブラウザ操作を記録して -OutConfig に保存する
 
 .PARAMETER ClickNav
-    （記録時）バッチ用の記録にする。URLが変わるクリック（サジェスト候補の選択など）も
+    （記録時）バッチ用の記録にする。URLが変わるクリック（検索結果の行の選択など）も
     goto に変換せず click のまま残すので、入力した宛名番号に応じて遷移先が変わる
 
 .PARAMETER KojinNo
@@ -68,7 +68,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:CdpId = 0
-$script:BatchMode = $false   # バッチ実行中か（本物の入力で操作し、合わなければその件を打ち切る）
+$script:BatchMode = $false   # バッチ実行中か（対象が見つからなければスキップせず、その件を打ち切る）
 
 # .NET の相対パス基準(WriteAllBytes等)を PowerShell のカレントに合わせる。
 # これをしないと、別ディレクトリから起動した際に出力先がずれる。
@@ -262,273 +262,83 @@ new Promise((resolve) => {
 }
 
 # ---------------------------------------------------------------------------
-# バッチ実行時の操作（本物のマウス操作・キー入力）
-#   業務システムの部品には、プログラムから投げたイベントでは反応しないものがある
-#   （キーを離した時だけ検索する／マウスを押した瞬間に候補を選ぶ 等）。
-#   バッチ用記録の再生では、人と同じ入力を Edge に送る。
+# クリックの共通部品（JS）… cas_auto_report と同じもの
+#   通常のクリックと「位置で押す(by_index)」で押し方を同じにするため、ここに1本化してある。
+#   resolve は埋め込み先の Promise のものを使う。
 # ---------------------------------------------------------------------------
-
-# 画面上の座標をマウスでクリックする（移動 → 押す → 離す）
-function Send-MouseClick {
-    param($Ws, [double]$X, [double]$Y)
-    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mouseMoved"; x = $X; y = $Y } | Out-Null
-    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mousePressed"; x = $X; y = $Y; button = "left"; buttons = 1; clickCount = 1 } | Out-Null
-    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mouseReleased"; x = $X; y = $Y; button = "left"; buttons = 0; clickCount = 1 } | Out-Null
-}
-
-# 文字を入力しないキー（Backspace など）を押して離す
-function Send-KeyStroke {
-    param($Ws, [string]$Key, [string]$Code, [int]$KeyCode, [int]$Modifiers = 0)
-    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params @{ type = "rawKeyDown"; key = $Key; code = $Code; windowsVirtualKeyCode = $KeyCode; modifiers = $Modifiers } | Out-Null
-    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params @{ type = "keyUp"; key = $Key; code = $Code; windowsVirtualKeyCode = $KeyCode; modifiers = $Modifiers } | Out-Null
-}
-
-# 文字列を1文字ずつキー入力する（キーを押す → 離す）
-function Send-KeyText {
-    param($Ws, [string]$Text)
-    foreach ($ch in $Text.ToCharArray()) {
-        $c = [string]$ch
-        $down = @{ type = "keyDown"; key = $c; text = $c }
-        $up   = @{ type = "keyUp"; key = $c }
-        $code = $null; $keyCode = 0
-        if ($c -match '^[0-9]$') { $code = "Digit$c"; $keyCode = 48 + [int]$c }
-        elseif ($c -match '^[A-Za-z]$') { $code = "Key$($c.ToUpper())"; $keyCode = [int][char]($c.ToUpper()) }
-        if ($code) {
-            $down.code = $code; $down.windowsVirtualKeyCode = $keyCode
-            $up.code = $code;   $up.windowsVirtualKeyCode = $keyCode
-        }
-        Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params $down | Out-Null
-        Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params $up | Out-Null
-        Start-Sleep -Milliseconds 30
-    }
-}
-
-# 操作対象に付けた目印（data-cap-target）を外す
-$script:ClearTargetMarkJs = @'
-(function(){ Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); }); return true; })()
+$script:ClickHelpersJs = @'
+  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  // click() は HTML の要素にしかない。SVG(アイコン等)には無いので、そのまま呼ぶと
+  // 「e.click is not a function」で落ちる。その場合はマウス操作を作って投げる。
+  // 投げ先は要素そのもの。イベントは祖先へ伝わるので、ボタン側の処理も動く。
+  function rawClick(e){
+    var r=e.getBoundingClientRect();
+    var x=r.left+r.width/2, y=r.top+r.height/2;
+    // detail(押した回数)・pointerType(何で押したか)まで入れる。
+    // これを見て動きを決めるページがあり、無いと「エラーは出ないが何も起きない」になる。
+    var m={bubbles:true, cancelable:true, composed:true, view:window,
+           clientX:x, clientY:y, screenX:x, screenY:y,
+           button:0, buttons:1, detail:1};
+    var p={}; for(var k in m) p[k]=m[k];
+    p.pointerId=1; p.pointerType='mouse'; p.isPrimary=true; p.width=1; p.height=1; p.pressure=0.5;
+    try { e.dispatchEvent(new PointerEvent('pointerdown', p)); } catch(_){}
+    e.dispatchEvent(new MouseEvent('mousedown', m));
+    // click() と違い、投げるだけではフォーカスが移らないので明示的に当てる
+    try { if(typeof e.focus==='function') e.focus({preventScroll:true}); } catch(_){}
+    var pu={}; for(var k2 in p) pu[k2]=p[k2];
+    pu.buttons=0; pu.pressure=0;
+    try { e.dispatchEvent(new PointerEvent('pointerup', pu)); } catch(_){}
+    var mu={}; for(var k3 in m) mu[k3]=m[k3];
+    mu.buttons=0;
+    e.dispatchEvent(new MouseEvent('mouseup', mu));
+    e.dispatchEvent(new MouseEvent('click', mu));
+  }
+  function go(e,how){
+    e.scrollIntoView({block:'center'});
+    // 押す相手は記録した要素そのもの。祖先に押し替えると、
+    // 押された場所を見て動きを変えるページで結果が変わるため。
+    if(typeof e.click==='function'){ e.click(); } else { rawClick(e); }
+    return resolve(how);
+  }
 '@
 
-# 目印を付けた要素を、座標が他の要素に隠れていたときだけ直接クリックする。
-# SVG(アイコン等)には click() が無いので、その場合はクリックのイベントを投げる。
-$script:ClickMarkedTargetJs = @'
-(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.removeAttribute('data-cap-target'); if(typeof e.click==='function'){ e.click(); } else { e.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); } return true; })()
-'@
-
-# 位置で押す（by_index）… 通常キャプチャ（バッチ以外）で再生するとき用。
-#   ボタン名は一切見ず、画面に見えている該当要素がちょうど1件のときだけ押す。2件以上なら押さずに失敗。
-#   （バッチ実行では Invoke-BatchClick が同じ規則で、本物のマウス操作で押す）
+# ---------------------------------------------------------------------------
+# 位置で押す（by_index）
+#   対象者ごとに表示が変わる行（氏名だけの一覧など）は、記録した「ボタン名」で照合すると
+#   2人目以降で外れる。そこでボタン名を一切見ずに、セレクタで取れる要素を押す。
+#   ただし押すのは「画面に見えているものがちょうど1件」のときだけ。2件以上なら押さずに失敗する。
+#   数えるときは位置の番号(:nth-of-type)を外す（行が複数並んでいても1件に絞れてしまわないように）。
+# ---------------------------------------------------------------------------
 function Invoke-ClickByIndex {
     param($Ws, $Action)
-    $js = @'
-new Promise(function (resolve) {
-  var sel = __SEL__, deadline = Date.now() + __TO__;
-  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+
+    $sel = ConvertTo-JsLiteral $Action.selector
+    $to  = $script:ActionTimeoutMs
+    $expr = @"
+new Promise((resolve) => {
+  const sel = $sel, deadline = Date.now() + $to;
+$($script:ClickHelpersJs)
   (function check(){
     var list = [];
     try { list = Array.prototype.slice.call(document.querySelectorAll(sel.replace(/:nth-of-type\(\d+\)/g, ''))).filter(visible); } catch(e){}
-    if (list.length === 1) {
-      var e = list[0];
-      e.scrollIntoView({ block: 'center' });
-      if (typeof e.click === 'function') { e.click(); } else { e.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); }
-      return resolve('clicked');
-    }
+    // ちょうど1件のときだけ押す
+    if (list.length === 1) return go(list[0], 'clicked');
+    // 2件以上は押さない。待っても減らないので、その場で失敗にする
     if (list.length > 1) return resolve('multi:' + list.length);
+    // 0件はまだ描画中かもしれないので待つ
     if (Date.now() > deadline) return resolve('notfound');
     setTimeout(check, 150);
   })();
 })
-'@
-    $expr = $js.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
-    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
+"@
     $st = "" + (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true)
-    if ($st -like "multi:*") { throw "位置で押す対象が$($st.Substring(6))件見つかりました(1件のはず): $($Action.selector)" }
-    if ($st -eq "notfound") { throw "位置で押す対象が見つかりません: $($Action.selector)" }
+    if ($st -like "multi:*") {
+        throw "位置で押す対象が$($st.Substring(6))件見つかりました(1件のはず): $($Action.selector)"
+    }
+    if ($st -eq "notfound") {
+        throw "位置で押す対象が見つかりません: $($Action.selector)"
+    }
     Write-Host "  (位置で押す: $($Action.selector))"
-}
-
-# バッチ実行のクリック。見つからない・特定できないときは例外（＝その件を打ち切る）。
-#   ボタン名に宛名番号が入っていたクリック（match_kojin_no あり）
-#     → 宛名番号を含む要素だけで探す。氏名や位置では選ばない（別人の候補を押さないため）
-#   それ以外
-#     → 記録位置＋ボタン名 → ボタン名 →（ボタン名が無い時のみ）記録位置
-#     → それでも無ければ、記録した要素と同じ種類（位置の番号は無視）が画面に1つだけならそれ
-function Invoke-BatchClick {
-    param($Ws, $Action)
-    $findJs = @'
-new Promise(function (resolve) {
-  var sel = __SEL__, text = __TXT__, no = __NO__, byIndex = __BYINDEX__, deadline = Date.now() + __TO__;
-  var CLICKABLE = 'a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[tabindex],[onclick]';
-  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
-  function txtOf(e){
-    var s=(e.innerText||e.textContent||'').trim();
-    if(!s){ try { s=((e.getAttribute('aria-label')||e.getAttribute('title'))||'').trim(); } catch(_){} }
-    return s;
-  }
-  function matches(a,b){
-    if(!a||!b) return false;
-    if(a===b) return true;
-    return (b.length>=2 && a.indexOf(b)>=0) || (a.length>=2 && b.indexOf(a)>=0);
-  }
-  // 前後が英数字でない位置に宛名番号があるか（11111 が 111119 に当たらないように）
-  function hasNo(s){
-    var i = s.indexOf(no);
-    while (i >= 0) {
-      var before = i === 0 ? '' : s.charAt(i - 1), after = s.charAt(i + no.length);
-      if (!/[0-9A-Za-z]/.test(before) && !/[0-9A-Za-z]/.test(after)) return true;
-      i = s.indexOf(no, i + 1);
-    }
-    return false;
-  }
-  function all(q){ try { return Array.prototype.slice.call(document.querySelectorAll(q)).filter(visible); } catch(e){ return []; } }
-  (function check(){
-    var el = null; try { el = document.querySelector(sel); } catch(e){}
-    var target = null, how = '', ambiguous = false;
-    if (byIndex) {
-      // 位置で押す：ボタン名は一切見ず、画面に見えている該当要素がちょうど1件のときだけ押す。
-      // 位置の番号(:nth-of-type)は外して数える（候補が複数並んでいても1件に絞れてしまわないように）
-      var list = all(sel.replace(/:nth-of-type\(\d+\)/g, ''));
-      if (list.length === 1) { target = list[0]; how = 'index'; }
-      else if (list.length > 1) { return resolve(JSON.stringify({ status: 'multi', count: list.length })); }
-    } else if (no) {
-      if (visible(el) && hasNo(txtOf(el))) { target = el; how = 'number'; }
-      else {
-        var hits = all(CLICKABLE).filter(function(e){ return hasNo(txtOf(e)); });
-        // 入れ子（候補の行と、その中のリンク等）は内側を優先
-        hits = hits.filter(function(e){ return !hits.some(function(o){ return o !== e && e.contains(o); }); });
-        if (hits.length === 1) { target = hits[0]; how = 'number'; }
-        else if (hits.length > 1) { ambiguous = true; }
-      }
-    } else {
-      if (visible(el) && (!text || matches(txtOf(el), text))) { target = el; how = 'recorded'; }
-      else {
-        var byText = null;
-        if (text) {
-          var list = all(CLICKABLE);
-          byText = list.find(function(e){ return txtOf(e) === text; }) || list.find(function(e){ return matches(txtOf(e), text); });
-        }
-        if (byText) { target = byText; how = 'text'; }
-        else if (!text && visible(el)) { target = el; how = 'notext'; }
-      }
-    }
-    if (target) {
-      Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); });
-      target.setAttribute('data-cap-target', '1');
-      target.scrollIntoView({ block: 'center', inline: 'center' });
-      var r = target.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
-      var hit = document.elementFromPoint(x, y);
-      var covered = !(hit && (hit === target || target.contains(hit)));
-      return resolve(JSON.stringify({ status: 'found', how: how, x: x, y: y, covered: covered, label: txtOf(target).slice(0, 40) }));
-    }
-    if (Date.now() > deadline) return resolve(JSON.stringify({ status: ambiguous ? 'ambiguous' : 'notfound' }));
-    setTimeout(check, 150);
-  })();
-})
-'@
-    $byIndex = [bool]$Action.by_index
-    $no = if ($Action.match_kojin_no -and -not $byIndex) { [string]$Action.match_kojin_no } else { "" }
-    $expr = $findJs.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
-    $expr = $expr.Replace('__TXT__', (ConvertTo-JsLiteral ([string]$Action.text)))
-    $expr = $expr.Replace('__NO__', (ConvertTo-JsLiteral $no))
-    $expr = $expr.Replace('__BYINDEX__', $(if ($byIndex) { 'true' } else { 'false' }))
-    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
-    $st = (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true) | ConvertFrom-Json
-
-    if ($st.status -eq 'multi') {
-        throw "位置で押す対象が$($st.count)件見つかりました(1件のはず): $($Action.selector)"
-    }
-    if ($st.status -eq 'ambiguous') {
-        throw "宛名番号 $no を含む候補が複数あり、1つに決められません: $($Action.selector)"
-    }
-    if ($st.status -ne 'found') {
-        if ($byIndex) { throw "位置で押す対象が見つかりません: $($Action.selector)" }
-        if ($no) { throw "宛名番号 $no を含むクリック対象が見つかりません: $($Action.selector)" }
-        throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))"
-    }
-
-    if ($st.covered) {
-        # 座標に別の要素が重なっていてマウスが届かない → 要素を直接クリック
-        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClickMarkedTargetJs | Out-Null
-        $method = "直接"
-    } else {
-        Send-MouseClick -Ws $Ws -X ([double]$st.x) -Y ([double]$st.y)
-        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClearTargetMarkJs | Out-Null
-        $method = "マウス"
-    }
-    $how = switch ($st.how) {
-        'number'   { "宛名番号一致" }
-        'recorded' { "記録位置" }
-        'text'     { "ボタン名一致" }
-        'notext'   { "記録位置(ボタン名なし)" }
-        'index'    { "位置で押す(1件のみ)" }
-        default    { $st.how }
-    }
-    Write-Host "  (クリック[$method/$how]: $($st.label))"
-}
-
-# バッチ実行の入力。欄をクリックして既存の値を消し、1文字ずつキー入力する。
-function Invoke-BatchFill {
-    param($Ws, $Action)
-    $findJs = @'
-new Promise(function (resolve) {
-  var sel = __SEL__, deadline = Date.now() + __TO__;
-  (function check(){
-    var el = null; try { el = document.querySelector(sel); } catch(e){}
-    if (el) {
-      Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); });
-      el.setAttribute('data-cap-target', '1');
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
-      var hit = document.elementFromPoint(x, y);
-      var covered = !(hit && (hit === el || el.contains(hit)));
-      return resolve(JSON.stringify({ status: 'found', x: x, y: y, covered: covered }));
-    }
-    if (Date.now() > deadline) return resolve(JSON.stringify({ status: 'notfound' }));
-    setTimeout(check, 150);
-  })();
-})
-'@
-    # 欄にフォーカスして全選択し、今の値の長さを返す
-    $selectAllJs = @'
-(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return -1; if(document.activeElement!==e) e.focus(); try { e.select(); } catch(_){} return (e.value||'').length; })()
-'@
-    $valueJs = @'
-(function(){ var e=document.querySelector('[data-cap-target]'); return e ? (e.value||'') : ''; })()
-'@
-    $clearByScriptJs = @'
-(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.value=''; e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()
-'@
-    $expr = $findJs.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
-    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
-    $st = (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true) | ConvertFrom-Json
-    if ($st.status -ne 'found') { throw "入力対象が見つかりません: $($Action.selector)" }
-
-    try {
-        # 人と同じく欄をクリックしてから打つ（隠れている時はフォーカスだけ）
-        if (-not $st.covered) { Send-MouseClick -Ws $Ws -X ([double]$st.x) -Y ([double]$st.y) }
-        $len = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $selectAllJs)
-        if ($len -lt 0) { throw "入力対象が見つかりません: $($Action.selector)" }
-        if ($len -gt 0) {
-            Send-KeyStroke -Ws $Ws -Key "Backspace" -Code "Backspace" -KeyCode 8
-            if ((Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs) -ne "") {
-                # 全選択が効かない欄 → Ctrl+A → Backspace、それでも残れば値を直接消す
-                Send-KeyStroke -Ws $Ws -Key "a" -Code "KeyA" -KeyCode 65 -Modifiers 2
-                Send-KeyStroke -Ws $Ws -Key "Backspace" -Code "Backspace" -KeyCode 8
-                if ((Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs) -ne "") {
-                    Invoke-PageScriptSafe -Ws $Ws -Expression $clearByScriptJs | Out-Null
-                }
-            }
-        }
-
-        $value = [string]$Action.value
-        Send-KeyText -Ws $Ws -Text $value
-        $actual = [string](Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs)
-        Write-Host "  (入力[キー入力]: $($Action.selector) = $value → 欄の値: $actual)"
-        if ($actual.Trim() -ne $value.Trim()) {
-            Write-Warning "入力後の欄の値が記録と違います（期待: $value / 実際: $actual）。書式を整える欄なら問題ありません。"
-        }
-    } finally {
-        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClearTargetMarkJs | Out-Null
-    }
 }
 
 # ---------------------------------------------------------------------------
@@ -539,26 +349,37 @@ function Invoke-CapAction {
 
     switch ($Action.type) {
         "click" {
-            # バッチ実行は本物のマウス操作＋宛名番号での照合（見つからなければその件を打ち切る）
-            if ($script:BatchMode) { Invoke-BatchClick -Ws $Ws -Action $Action; break }
             # 位置で押す印の付いたクリックは、ボタン名での照合をしない
             if ([bool]$Action.by_index) { Invoke-ClickByIndex -Ws $Ws -Action $Action; break }
 
             # ハイブリッド特定：セレクタで当てた要素を「記録時のボタン名(text/aria-label)」で検証する。
             # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
+            # ボタン名に宛名番号が入っていたクリック（match_kojin_no あり。検索結果の行など）は、
+            # 宛名番号だけで照合する（氏名は人ごとに違うため）。前後が英数字の所は一致とみなさない（11111 と 111119 を区別）。
             $sel = ConvertTo-JsLiteral $Action.selector
             $txt = ConvertTo-JsLiteral ([string]$Action.text)
+            $no  = ConvertTo-JsLiteral $(if ($Action.match_kojin_no) { [string]$Action.match_kojin_no } else { "" })
             $to  = $script:ActionTimeoutMs
             $expr = @"
 new Promise((resolve) => {
-  const sel = $sel, text = $txt, deadline = Date.now() + $to;
-  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  const sel = $sel, text = $txt, no = $no, deadline = Date.now() + $to;
+$($script:ClickHelpersJs)
   function txtOf(e){
     var s=(e.innerText||e.textContent||'').trim();
     if(!s){ try { s=((e.getAttribute('aria-label')||e.getAttribute('title'))||'').trim(); } catch(_){} }
     return s;
   }
+  function hasNo(s){
+    var i = s.indexOf(no);
+    while (i >= 0) {
+      var before = i === 0 ? '' : s.charAt(i - 1), after = s.charAt(i + no.length);
+      if (!/[0-9A-Za-z]/.test(before) && !/[0-9A-Za-z]/.test(after)) return true;
+      i = s.indexOf(no, i + 1);
+    }
+    return false;
+  }
   function matches(a,b){
+    if (no) return hasNo(a);
     if(!a||!b) return false;
     if(a===b) return true;
     return (b.length>=2 && a.indexOf(b)>=0) || (a.length>=2 && b.indexOf(a)>=0);
@@ -569,7 +390,6 @@ new Promise((resolve) => {
     return list.find(function(e){ return txtOf(e) === text; })
         || list.find(function(e){ return matches(txtOf(e), text); });
   }
-  function go(e,how){ e.scrollIntoView({block:'center'}); e.click(); return resolve(how); }
   (function check(){
     var el = null; try { el = document.querySelector(sel); } catch(e){}
     // 1) セレクタが当たり、かつ(テキスト未記録 or ラベル一致) → それをクリック
@@ -587,15 +407,16 @@ new Promise((resolve) => {
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
             switch ($st) {
-                'notfound'       { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
+                'notfound' {
+                    # バッチ実行ではその件を打ち切る（ずれた画面のまま進んで別の人を撮らないため）
+                    if ($script:BatchMode) { throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))" }
+                    Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)"
+                }
                 'text'           { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
                 'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector))" }
             }
         }
         "fill" {
-            # バッチ実行は本物のキー入力（キーを離した時に検索する部品でも候補が出るように）
-            if ($script:BatchMode) { Invoke-BatchFill -Ws $Ws -Action $Action; break }
-
             $sel = ConvertTo-JsLiteral $Action.selector
             $val = ConvertTo-JsLiteral $Action.value
             $to  = $script:ActionTimeoutMs
@@ -616,7 +437,10 @@ new Promise((resolve) => {
 })
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
-            if ($st -eq 'notfound') { Write-Warning "入力対象が見つかりません(スキップ): $($Action.selector)" }
+            if ($st -eq 'notfound') {
+                if ($script:BatchMode) { throw "入力対象が見つかりません: $($Action.selector)" }
+                Write-Warning "入力対象が見つかりません(スキップ): $($Action.selector)"
+            }
         }
         "wait" {
             $timeout = if ($Action.timeout) { [int]$Action.timeout } else { 5000 }
@@ -1066,13 +890,19 @@ function Invoke-Capture {
             Write-Host "キャプチャ保存: $filename"
         } else {
             # 複数画面を巡回キャプチャ（1ページの失敗で全体を止めない）
+            # 手順番号は全ページ通しで数える（記録終了時に出る手順一覧と同じ番号）
+            $stepNo = 0
             for ($i = 0; $i -lt $pagesCfg.Count; $i++) {
                 $pageConf = $pagesCfg[$i]
                 $name = if ($pageConf.name) { $pageConf.name } else { "page_{0:D3}" -f $i }
                 $actions = if ($pageConf.actions) { @($pageConf.actions) } else { @() }
 
+                $script:CurrentStep = $null
                 try {
                     foreach ($action in $actions) {
+                        $stepNo++
+                        # 失敗したとき、どの手順で落ちたかを理由に付けるために控えておく
+                        $script:CurrentStep = "手順$stepNo $(Get-RecActionDesc -Action $action)"
                         Invoke-CapAction -Ws $ws -Action $action -SettleMs $settleMs
                         if ([bool]$action.wait_after -and $waitAfterMs -gt 0) {
                             Write-Host "  (操作後の待ち: $waitAfterMs ms)"
@@ -1082,7 +912,10 @@ function Invoke-Capture {
                     Wait-PageReady -Ws $ws -SettleMs $settleMs
                 } catch {
                     # バッチ実行は、ずれた画面のまま撮り続けないよう、その件をここで打ち切る
-                    if ($script:BatchMode) { throw "ページ '$name'（$($i + 1)/$($pagesCfg.Count)）で打ち切り: $($_.Exception.Message)" }
+                    if ($script:BatchMode) {
+                        $where = if ($script:CurrentStep) { " $($script:CurrentStep)" } else { "" }
+                        throw "ページ '$name'（$($i + 1)/$($pagesCfg.Count)）${where} で打ち切り: $($_.Exception.Message)"
+                    }
                     Write-Warning "ページ '$name' の操作中にエラー(撮影は継続): $_"
                 }
 
@@ -1135,6 +968,9 @@ $script:RecorderJs = @'
       return c && c.length>1
         && !/[0-9]{3,}/.test(c)
         && !/^(ng-|v-|jsx-|css-|sc-|is-|has-|active|selected|open|show|hover|focus)/.test(c)
+        // 「いまの状態」を表すクラスは使わない。選んだ・入力した・開いた等で消えるため、
+        // 記録時に残すと2人目以降でセレクタが当たらなくなる（例 p-dropdown-label-empty）
+        && !/(^|-)(empty|filled|focus|focused|active|selected|checked|open|opened|expanded|collapsed|disabled|highlight|invalid|error|loading|busy|hover|dirty|touched|pristine)$/i.test(c)
         && !/--[0-9a-f]{4,}/.test(c)
         && !/[0-9a-f]{6,}/.test(c);
     });
@@ -1216,43 +1052,8 @@ $script:RecorderJs = @'
     var ty=(t.type||"").toLowerCase();
     return ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio";
   }
-  function shown(e){ return e && (e.offsetParent!==null || (e.getClientRects && e.getClientRects().length>0)); }
   // 同じ種類の要素（位置の番号は外す）の中で何番目か（1始まり）。「位置で押す」の記録用
   function idxOf(sel, el){ try { var l=document.querySelectorAll(sel.replace(/:nth-of-type\(\d+\)/g,"")); for(var i=0;i<l.length;i++){ if(l[i]===el) return i+1; } } catch(e){} return 1; }
-  // マウスを押した時点の対象を覚えておく。サジェスト候補のように「押した瞬間に選ばれて消える」部品では
-  // click が候補に届かないため、押した時点の要素で記録する。
-  var pressed = null;
-  var downH = function(e){
-    pressed = null;
-    if (e.button !== undefined && e.button !== 0) return;
-    var t=clickTarget(e.target);
-    if(!t || isTypingTarget(t)) return;
-    var ps=cssPath(t);
-    pressed = { el:t, selector:ps, text:labelOf(t), idx:idxOf(ps,t), ts:Date.now(), used:false };
-  };
-  var clickH = function(e){
-    if (pressed && !pressed.used && Date.now() - pressed.ts < 1500) {
-      pressed.used = true;
-      push({type:"click", selector:pressed.selector, text:pressed.text, idx:pressed.idx});
-      return;
-    }
-    var t=clickTarget(e.target);
-    if(!t || isTypingTarget(t)) return;
-    var cs=cssPath(t);
-    push({type:"click", selector:cs, text:labelOf(t), idx:idxOf(cs,t)});
-  };
-  var upH = function(){
-    var p = pressed;
-    if (!p) return;
-    // click は mouseup の直後に届く。届かないまま押した要素が消えていたら、押した要素で記録する
-    setTimeout(function(){
-      if (!p.used && (!p.el.isConnected || !shown(p.el))) {
-        p.used = true;
-        push({type:"click", selector:p.selector, text:p.text, idx:p.idx});
-      }
-      if (pressed === p) pressed = null;
-    }, 50);
-  };
   // テキスト系の入力欄か（チェックボックス等はクリックで記録、パスワードは記録ファイルに残さない）
   function isTextField(el){
     var tag=(el.tagName||"").toLowerCase();
@@ -1260,51 +1061,34 @@ $script:RecorderJs = @'
     if(tag!=="input") return false;
     return !/^(checkbox|radio|file|submit|button|reset|image|range|color|password|hidden)$/i.test(el.type||"");
   }
+  // cas_auto_report と同じ拾い方：クリックは「実際にクリックが届いた要素」で記録する
+  var clickH = function(e){
+    var t=clickTarget(e.target);
+    if(!t || isTypingTarget(t)) return;
+    var cs=cssPath(t);
+    push({type:"click", selector:cs, text:labelOf(t), idx:idxOf(cs,t)});
+  };
+  // 入力は確定した値（change）で記録する。検索ボタンを押すと欄を離れるので、クリックより先に届く
   var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
     if(tag==="select"){ push({type:"select", selector:cssPath(el), value:el.value}); }
-    else if(isTextField(el)){
-      // 人がキー入力した欄の change は記録しない（値は input で記録済み）。
-      // サジェスト候補を選んだ後に部品が書き戻す「番号＋氏名」などを拾わないため。
-      // キー入力なしで値が変わった欄（日付選択など）の change は記録する。
-      // 部品が自分で change を投げた後に、欄を離れた時の change がもう一度来ることがあるので、
-      // 目印は change では消さず、欄に次にフォーカスが入った時に消す。
-      if (el.__capTyped) return;
-      push({type:"fill", selector:cssPath(el), value:el.value});
-    }
-  };
-  // 欄にフォーカスが入ったら「キー入力済み」の目印を消す（新しい入力の始まり）
-  var focusH = function(e){
-    var el=e.target;
-    if(el && isTextField(el)){ el.__capTyped = false; }
-  };
-  // 人のキー入力。サジェスト候補のクリックでは change がクリックより後になる／発火しないことがあり、
-  // 宛名番号の入力が記録から漏れるのを防ぐ（同じ欄の連続入力は記録側で最後の値にまとめる）。
-  var inputH = function(e){
-    var el=e.target;
-    if(isTextField(el)){ el.__capTyped = true; push({type:"fill", selector:cssPath(el), value:el.value}); }
+    else if(isTextField(el)){ push({type:"fill", selector:cssPath(el), value:el.value}); }
   };
 
   // 古いハンドラがあれば除去して最新を付け直す。
   // これにより「ページを開いたまま録り直し」ても古いcssPath実装が残らない。
+  // （以前の版が付けていた pointerdown/pointerup/input/focusin の記録も外す）
   try { if(window.__capClickH)  document.removeEventListener("click",       window.__capClickH,  true); } catch(e){}
   try { if(window.__capChangeH) document.removeEventListener("change",      window.__capChangeH, true); } catch(e){}
   try { if(window.__capInputH)  document.removeEventListener("input",       window.__capInputH,  true); } catch(e){}
   try { if(window.__capDownH)   document.removeEventListener("pointerdown", window.__capDownH,   true); } catch(e){}
   try { if(window.__capUpH)     document.removeEventListener("pointerup",   window.__capUpH,     true); } catch(e){}
   try { if(window.__capFocusH)  document.removeEventListener("focusin",     window.__capFocusH,  true); } catch(e){}
+  window.__capInputH = null; window.__capDownH = null; window.__capUpH = null; window.__capFocusH = null;
   window.__capClickH = clickH;
   window.__capChangeH = changeH;
-  window.__capInputH = inputH;
-  window.__capDownH = downH;
-  window.__capUpH = upH;
-  window.__capFocusH = focusH;
-  document.addEventListener("focusin",     focusH,  true);
-  document.addEventListener("pointerdown", downH,   true);
-  document.addEventListener("pointerup",   upH,     true);
-  document.addEventListener("click",       clickH,  true);
-  document.addEventListener("change",      changeH, true);
-  document.addEventListener("input",       inputH,  true);
+  document.addEventListener("click",  clickH,  true);
+  document.addEventListener("change", changeH, true);
 })();
 '@
 
@@ -1400,7 +1184,7 @@ function Add-RecordSample {
     foreach ($e in @($obj.events)) {
         if ($e.type -eq "click") {
             # クリックはすぐページ化せず“保留”する。数ポーリング以内にURLが変われば
-            #   → 遷移リンク/サジェスト等 → 宛先URLへの goto として確定（URLで確実に再現できる）
+            #   → 遷移リンク/検索結果の行等 → 宛先URLへの goto として確定（URLで確実に再現できる）
             # URLが変わらなければ
             #   → ページ内クリック(タブ/モーダル等) → click として確定（ボタン名で照合）
             if ($script:RecPendingClick) { Resolve-PendingClick -Verbose $Verbose }
@@ -1704,7 +1488,8 @@ function Start-Recording {
         if ($ClickNav) {
             Write-Host "[バッチ用記録]"
             Write-Host "  1. まず、どの画面からでも押せるメニュー（検索画面を開くリンク等）をクリックする"
-            Write-Host "  2. 検索欄に宛名番号 $KojinNo をキーボードで入力し、サジェスト候補をクリックする"
+            Write-Host "  2. 検索欄に宛名番号 $KojinNo をキーボードで手入力し、検索ボタンを押して、対象者一覧の行をクリックする"
+            Write-Host "     （入力中にサジェスト（候補）が出ても選ばない。貼り付けやオートコンプリートだと記録されないことがある）"
             Write-Host "  3. 確認したい画面まで、画面内のボタンやタブで操作する（ブラウザの戻る・アドレス入力は使わない）"
         }
         Write-Host "記録を終了するには、このウィンドウで Enter キーを押してください。"

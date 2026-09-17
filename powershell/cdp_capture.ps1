@@ -308,10 +308,43 @@ $script:ClearTargetMarkJs = @'
 (function(){ Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); }); return true; })()
 '@
 
-# 目印を付けた要素を、座標が他の要素に隠れていたときだけ直接クリックする
+# 目印を付けた要素を、座標が他の要素に隠れていたときだけ直接クリックする。
+# SVG(アイコン等)には click() が無いので、その場合はクリックのイベントを投げる。
 $script:ClickMarkedTargetJs = @'
-(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.removeAttribute('data-cap-target'); e.click(); return true; })()
+(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.removeAttribute('data-cap-target'); if(typeof e.click==='function'){ e.click(); } else { e.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); } return true; })()
 '@
+
+# 位置で押す（by_index）… 通常キャプチャ（バッチ以外）で再生するとき用。
+#   ボタン名は一切見ず、画面に見えている該当要素がちょうど1件のときだけ押す。2件以上なら押さずに失敗。
+#   （バッチ実行では Invoke-BatchClick が同じ規則で、本物のマウス操作で押す）
+function Invoke-ClickByIndex {
+    param($Ws, $Action)
+    $js = @'
+new Promise(function (resolve) {
+  var sel = __SEL__, deadline = Date.now() + __TO__;
+  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  (function check(){
+    var list = [];
+    try { list = Array.prototype.slice.call(document.querySelectorAll(sel.replace(/:nth-of-type\(\d+\)/g, ''))).filter(visible); } catch(e){}
+    if (list.length === 1) {
+      var e = list[0];
+      e.scrollIntoView({ block: 'center' });
+      if (typeof e.click === 'function') { e.click(); } else { e.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); }
+      return resolve('clicked');
+    }
+    if (list.length > 1) return resolve('multi:' + list.length);
+    if (Date.now() > deadline) return resolve('notfound');
+    setTimeout(check, 150);
+  })();
+})
+'@
+    $expr = $js.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
+    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
+    $st = "" + (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true)
+    if ($st -like "multi:*") { throw "位置で押す対象が$($st.Substring(6))件見つかりました(1件のはず): $($Action.selector)" }
+    if ($st -eq "notfound") { throw "位置で押す対象が見つかりません: $($Action.selector)" }
+    Write-Host "  (位置で押す: $($Action.selector))"
+}
 
 # バッチ実行のクリック。見つからない・特定できないときは例外（＝その件を打ち切る）。
 #   ボタン名に宛名番号が入っていたクリック（match_kojin_no あり）
@@ -323,7 +356,7 @@ function Invoke-BatchClick {
     param($Ws, $Action)
     $findJs = @'
 new Promise(function (resolve) {
-  var sel = __SEL__, text = __TXT__, no = __NO__, deadline = Date.now() + __TO__, started = Date.now(), singleSeen = 0, sameCount = 0;
+  var sel = __SEL__, text = __TXT__, no = __NO__, byIndex = __BYINDEX__, deadline = Date.now() + __TO__;
   var CLICKABLE = 'a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[tabindex],[onclick]';
   function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
   function txtOf(e){
@@ -350,7 +383,13 @@ new Promise(function (resolve) {
   (function check(){
     var el = null; try { el = document.querySelector(sel); } catch(e){}
     var target = null, how = '', ambiguous = false;
-    if (no) {
+    if (byIndex) {
+      // 位置で押す：ボタン名は一切見ず、画面に見えている該当要素がちょうど1件のときだけ押す。
+      // 位置の番号(:nth-of-type)は外して数える（候補が複数並んでいても1件に絞れてしまわないように）
+      var list = all(sel.replace(/:nth-of-type\(\d+\)/g, ''));
+      if (list.length === 1) { target = list[0]; how = 'index'; }
+      else if (list.length > 1) { return resolve(JSON.stringify({ status: 'multi', count: list.length })); }
+    } else if (no) {
       if (visible(el) && hasNo(txtOf(el))) { target = el; how = 'number'; }
       else {
         var hits = all(CLICKABLE).filter(function(e){ return hasNo(txtOf(e)); });
@@ -369,13 +408,6 @@ new Promise(function (resolve) {
         }
         if (byText) { target = byText; how = 'text'; }
         else if (!text && visible(el)) { target = el; how = 'notext'; }
-        else if (text && Date.now() - started >= 1000) {
-          // 描画途中の一瞬を拾わないよう、1秒待ってから2回続けて1件だった時だけ採用
-          var same = all(sel.replace(/:nth-of-type\(\d+\)/g, ''));
-          sameCount = same.length;
-          if (same.length === 1) { singleSeen++; if (singleSeen >= 2) { target = same[0]; how = 'single'; } }
-          else { singleSeen = 0; }
-        }
       }
     }
     if (target) {
@@ -387,25 +419,28 @@ new Promise(function (resolve) {
       var covered = !(hit && (hit === target || target.contains(hit)));
       return resolve(JSON.stringify({ status: 'found', how: how, x: x, y: y, covered: covered, label: txtOf(target).slice(0, 40) }));
     }
-    if (Date.now() > deadline) return resolve(JSON.stringify({ status: ambiguous ? 'ambiguous' : (sameCount > 1 ? 'ambiguous-same' : 'notfound'), count: sameCount }));
+    if (Date.now() > deadline) return resolve(JSON.stringify({ status: ambiguous ? 'ambiguous' : 'notfound' }));
     setTimeout(check, 150);
   })();
 })
 '@
-    $no = if ($Action.match_kojin_no) { [string]$Action.match_kojin_no } else { "" }
+    $byIndex = [bool]$Action.by_index
+    $no = if ($Action.match_kojin_no -and -not $byIndex) { [string]$Action.match_kojin_no } else { "" }
     $expr = $findJs.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
     $expr = $expr.Replace('__TXT__', (ConvertTo-JsLiteral ([string]$Action.text)))
     $expr = $expr.Replace('__NO__', (ConvertTo-JsLiteral $no))
+    $expr = $expr.Replace('__BYINDEX__', $(if ($byIndex) { 'true' } else { 'false' }))
     $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
     $st = (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true) | ConvertFrom-Json
 
+    if ($st.status -eq 'multi') {
+        throw "位置で押す対象が$($st.count)件見つかりました(1件のはず): $($Action.selector)"
+    }
     if ($st.status -eq 'ambiguous') {
         throw "宛名番号 $no を含む候補が複数あり、1つに決められません: $($Action.selector)"
     }
-    if ($st.status -eq 'ambiguous-same') {
-        throw "ボタン名 '$($Action.text)' が見つからず、同じ種類の要素が $($st.count) 件あって1つに決められません: $($Action.selector)"
-    }
     if ($st.status -ne 'found') {
+        if ($byIndex) { throw "位置で押す対象が見つかりません: $($Action.selector)" }
         if ($no) { throw "宛名番号 $no を含むクリック対象が見つかりません: $($Action.selector)" }
         throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))"
     }
@@ -424,7 +459,7 @@ new Promise(function (resolve) {
         'recorded' { "記録位置" }
         'text'     { "ボタン名一致" }
         'notext'   { "記録位置(ボタン名なし)" }
-        'single'   { "同じ種類が1件のみ" }
+        'index'    { "位置で押す(1件のみ)" }
         default    { $st.how }
     }
     Write-Host "  (クリック[$method/$how]: $($st.label))"
@@ -506,6 +541,8 @@ function Invoke-CapAction {
         "click" {
             # バッチ実行は本物のマウス操作＋宛名番号での照合（見つからなければその件を打ち切る）
             if ($script:BatchMode) { Invoke-BatchClick -Ws $Ws -Action $Action; break }
+            # 位置で押す印の付いたクリックは、ボタン名での照合をしない
+            if ([bool]$Action.by_index) { Invoke-ClickByIndex -Ws $Ws -Action $Action; break }
 
             # ハイブリッド特定：セレクタで当てた要素を「記録時のボタン名(text/aria-label)」で検証する。
             # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
@@ -988,6 +1025,10 @@ function Invoke-Capture {
     $script:ReadySelector = if ($Cfg.ready_selector) { [string]$Cfg.ready_selector } else { "" }
     # 要素クリック/入力で対象を待つ最大時間（超えたらスキップして継続）
     $script:ActionTimeoutMs = if ($null -ne $Cfg.action_timeout_ms) { [int]$Cfg.action_timeout_ms } else { 5000 }
+    # 記録時に「実行後に待たせる」と指名した手順(wait_after)の後で待つ時間。
+    # 帳票の印刷プレビュー作成中の「くるくる」は絵が回るだけで画面の中身が変わらず、
+    # 通常の待機（DOMが落ち着くまで待つ）ではすり抜けて作成途中を撮ってしまうため、決めた時間だけ止まる。
+    $waitAfterMs = if ($null -ne $Cfg.wait_after_ms) { [int]$Cfg.wait_after_ms } else { 5000 }
 
     # SPA(Vue等)の認証付きシステム向け: goto をリロードせず pushState で行う
     $script:SpaMode = if ($null -ne $Cfg.spa_mode) { [bool]$Cfg.spa_mode } else { $false }
@@ -1033,6 +1074,10 @@ function Invoke-Capture {
                 try {
                     foreach ($action in $actions) {
                         Invoke-CapAction -Ws $ws -Action $action -SettleMs $settleMs
+                        if ([bool]$action.wait_after -and $waitAfterMs -gt 0) {
+                            Write-Host "  (操作後の待ち: $waitAfterMs ms)"
+                            Start-Sleep -Milliseconds $waitAfterMs
+                        }
                     }
                     Wait-PageReady -Ws $ws -SettleMs $settleMs
                 } catch {
@@ -1172,6 +1217,8 @@ $script:RecorderJs = @'
     return ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio";
   }
   function shown(e){ return e && (e.offsetParent!==null || (e.getClientRects && e.getClientRects().length>0)); }
+  // 同じ種類の要素（位置の番号は外す）の中で何番目か（1始まり）。「位置で押す」の記録用
+  function idxOf(sel, el){ try { var l=document.querySelectorAll(sel.replace(/:nth-of-type\(\d+\)/g,"")); for(var i=0;i<l.length;i++){ if(l[i]===el) return i+1; } } catch(e){} return 1; }
   // マウスを押した時点の対象を覚えておく。サジェスト候補のように「押した瞬間に選ばれて消える」部品では
   // click が候補に届かないため、押した時点の要素で記録する。
   var pressed = null;
@@ -1180,17 +1227,19 @@ $script:RecorderJs = @'
     if (e.button !== undefined && e.button !== 0) return;
     var t=clickTarget(e.target);
     if(!t || isTypingTarget(t)) return;
-    pressed = { el:t, selector:cssPath(t), text:labelOf(t), ts:Date.now(), used:false };
+    var ps=cssPath(t);
+    pressed = { el:t, selector:ps, text:labelOf(t), idx:idxOf(ps,t), ts:Date.now(), used:false };
   };
   var clickH = function(e){
     if (pressed && !pressed.used && Date.now() - pressed.ts < 1500) {
       pressed.used = true;
-      push({type:"click", selector:pressed.selector, text:pressed.text});
+      push({type:"click", selector:pressed.selector, text:pressed.text, idx:pressed.idx});
       return;
     }
     var t=clickTarget(e.target);
     if(!t || isTypingTarget(t)) return;
-    push({type:"click", selector:cssPath(t), text:labelOf(t)});
+    var cs=cssPath(t);
+    push({type:"click", selector:cs, text:labelOf(t), idx:idxOf(cs,t)});
   };
   var upH = function(){
     var p = pressed;
@@ -1199,7 +1248,7 @@ $script:RecorderJs = @'
     setTimeout(function(){
       if (!p.used && (!p.el.isConnected || !shown(p.el))) {
         p.used = true;
-        push({type:"click", selector:p.selector, text:p.text});
+        push({type:"click", selector:p.selector, text:p.text, idx:p.idx});
       }
       if (pressed === p) pressed = null;
     }, 50);
@@ -1288,6 +1337,7 @@ function Save-RecordedConfig {
     if ($null -ne $BaseCfg.stable_ms)         { $out.stable_ms = [int]$BaseCfg.stable_ms }
     if ($null -ne $BaseCfg.load_timeout_ms)   { $out.load_timeout_ms = [int]$BaseCfg.load_timeout_ms }
     if ($null -ne $BaseCfg.action_timeout_ms) { $out.action_timeout_ms = [int]$BaseCfg.action_timeout_ms }
+    if ($null -ne $BaseCfg.wait_after_ms)     { $out.wait_after_ms = [int]$BaseCfg.wait_after_ms }
     if ($BaseCfg.ready_selector)            { $out.ready_selector = [string]$BaseCfg.ready_selector }
     if ($BaseCfg.viewport) { $out.viewport = $BaseCfg.viewport }
 
@@ -1356,6 +1406,7 @@ function Add-RecordSample {
             if ($script:RecPendingClick) { Resolve-PendingClick -Verbose $Verbose }
             $clickAct = [ordered]@{ type = "click"; selector = $e.selector }
             if ($e.text) { $clickAct.text = [string]$e.text }
+            if ($null -ne $e.idx) { $clickAct._idx = [int]$e.idx }   # 位置で押す用（保存前に消す）
             # クリック時点までの入力をこのクリックに紐付ける（クリック後の入力と順序が混ざらないように）
             $snap = New-Object System.Collections.ArrayList
             foreach ($p in $script:RecPending) { [void]$snap.Add($p) }
@@ -1463,8 +1514,53 @@ function Initialize-RecordingState {
 }
 
 # 記録を締めくくって保存する（保留中のクリック/入力の確定・バッチ用記録の点検・保存）
+# 手順1行分の表示（記録終了時の一覧・質問で、同じ番号・同じ書式で使う）
+function Get-RecActionDesc {
+    param($Action)
+    switch ($Action.type) {
+        "click" {
+            if ($Action.by_index) { return "click $($Action.selector) (位置で押す)" }
+            if ($Action.text) { return "click $($Action.selector) ($($Action.text))" }
+            return "click $($Action.selector)"
+        }
+        "fill"   { return "fill $($Action.selector) = $($Action.value)" }
+        "select" { return "select $($Action.selector) = $($Action.value)" }
+        "goto"   { return "goto $($Action.url)" }
+        default  { return [string]$Action.type }
+    }
+}
+
+# 記録した手順を番号つきで並べ、番号をカンマ区切りで聞く。選ばれた手順の添字(0始まり)の一覧を返す。
+#   $Answer を渡した時は聞かずにそれを使う（テスト・自動化用）。Enterのみ（空）なら「なし」。
+#   不正な番号（数字以外・範囲外）は警告を出し、その番号だけ無視する（黙って採用しない）。
+function Read-StepNumbers {
+    param([string]$Question, $Steps, $Answer = $null)
+    Write-Host ""
+    Write-Host "$Question（全 $($Steps.Count) 手順）"
+    for ($n = 0; $n -lt $Steps.Count; $n++) {
+        Write-Host ("{0,3}: [{1}] {2}" -f ($n + 1), $Steps[$n].Page, (Get-RecActionDesc -Action $Steps[$n].Action))
+    }
+    $ans = if ($null -ne $Answer) { [string]$Answer } else { Read-Host "番号をカンマ区切りで入力（Enterで設定しない）" }
+    $picked = New-Object System.Collections.ArrayList
+    if ($ans) {
+        foreach ($tok in ($ans -split ',')) {
+            $t = $tok.Trim()
+            if (-not $t) { continue }
+            if ($t -match '^\d+$' -and [int]$t -ge 1 -and [int]$t -le $Steps.Count) {
+                $i = [int]$t - 1
+                if (-not $picked.Contains($i)) { [void]$picked.Add($i) }
+            } else {
+                Write-Warning "手順番号として正しくありません（この番号は無視します）: $t"
+            }
+        }
+    }
+    return ,$picked
+}
+
 function Complete-Recording {
-    param($Cfg, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "")
+    # $WaitAfterAnswer / $ByIndexAnswer: 記録終了時の質問の答え。渡さなければその場で聞く
+    param($Cfg, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "",
+          $WaitAfterAnswer = $null, $ByIndexAnswer = $null)
 
     # 未解決の保留クリックはページ内クリックとして確定し、残った入力も最後のページとして確定
     Resolve-PendingClick -Verbose $false
@@ -1498,6 +1594,59 @@ function Complete-Recording {
             Write-Warning "クリックを伴わない画面遷移が $($script:RecNavWarnings) 回ありました（記録していません）。バッチで同じ画面にたどり着けない可能性があります。"
         }
     }
+
+    # 全手順を記録順に並べる（どの撮影ポイントの手順かも表示する）
+    $steps = New-Object System.Collections.ArrayList
+    foreach ($pg in $pages) {
+        foreach ($a in $pg.actions) { [void]$steps.Add([pscustomobject]@{ Page = $pg.name; Action = $a }) }
+    }
+
+    # 「押しても効かない時間」「作成中を撮ってしまう」画面への対策（cas_auto_report の wait_after と同じ）。
+    # 帳票の印刷プレビュー作成中の「くるくる」は絵が回るだけで画面の中身が変わらず、機械には見分けられない。
+    # どこで待つかは人が指名する。判定はせず、再生時は wait_after_ms だけ止まる。
+    $waitIdx = Read-StepNumbers -Question "実行後に待たせる操作はどれですか？（帳票プレビューの作成が始まる操作など）" -Steps $steps -Answer $WaitAfterAnswer
+    if ($waitIdx.Count -eq 0) {
+        Write-Host "  操作後に待つ手順: なし"
+    } else {
+        foreach ($i in ($waitIdx | Sort-Object)) {
+            $steps[$i].Action["wait_after"] = $true
+            Write-Host "  操作後に待つ: 手順 $($i + 1) $(Get-RecActionDesc -Action $steps[$i].Action) （wait_after=true）"
+        }
+        Write-Host "  待つ時間は wait_after_ms（既定 5000ms）で決まります。"
+    }
+
+    # 対象者ごとに表示が変わる行（宛名番号が出ず氏名だけの候補・一覧など）は、記録した「ボタン名」で
+    # 照合すると2人目以降で外れるか、記録時の人の氏名で別人を押してしまう（cas_auto_report の by_index と同じ）。
+    # 指名されたクリックは氏名を保存せず、再生時は画面に見えている該当要素がちょうど1件のときだけ押す。
+    if ($ClickNav) {
+        $idxPicked = Read-StepNumbers -Question "対象者ごとに表示が変わる操作はどれですか？（氏名だけが出る候補・一覧の選択など）" -Steps $steps -Answer $ByIndexAnswer
+        $byIdx = New-Object System.Collections.ArrayList
+        foreach ($i in $idxPicked) {
+            if ($steps[$i].Action.type -ne "click") {
+                Write-Warning "クリックではないので位置で押せません（この番号は無視します）: $($i + 1) $(Get-RecActionDesc -Action $steps[$i].Action)"
+                continue
+            }
+            [void]$byIdx.Add($i)
+        }
+        if ($byIdx.Count -eq 0) {
+            Write-Host "  位置で押す手順: なし"
+        } else {
+            foreach ($i in ($byIdx | Sort-Object)) {
+                $a = $steps[$i].Action
+                $oldText = [string]$a["text"]
+                # ボタン名は保存しない（氏名が残ると2人目以降で照合が外れ、別人を押すおそれもあるため）
+                if ($a.Contains("text")) { $a.Remove("text") }
+                $a["by_index"] = $true
+                $a["index"] = if ($null -ne $a["_idx"]) { [int]$a["_idx"] } else { 1 }
+                Write-Host "  位置で押す: 手順 $($i + 1) $(Get-RecActionDesc -Action $a) （by_index=true / index=$($a["index"])）"
+                if ($oldText) { Write-Host "    ボタン名「$oldText」は保存しません（対象者ごとに変わるため）" }
+            }
+            Write-Host "  再生時は、画面に見えているものがちょうど1件のときだけ押します（2件以上なら押さずに失敗）。"
+        }
+    }
+
+    # 記録用の内部情報は記録ファイルに残さない
+    foreach ($s in $steps) { if ($s.Action.Contains("_idx")) { $s.Action.Remove("_idx") } }
 
     # バッチ用記録: 指定した宛名番号が記録されているか確認（無いとバッチで差し替えできない）
     if ($KojinNo) {
@@ -1825,6 +1974,8 @@ function Invoke-Batch {
         }
         Write-Host "記録 '$recName' を使用（宛名番号 $($cfg.kojin_no) → $($p.KojinNo) を $n 箇所差し替え）"
         if ($CdpUrl) { $cfg | Add-Member -NotePropertyName cdp_url -NotePropertyValue $CdpUrl -Force }
+        # 操作後の待ち時間は対応表の値を優先（記録を録り直さずに調整できるように）
+        if ($null -ne $map.wait_after_ms) { $cfg | Add-Member -NotePropertyName wait_after_ms -NotePropertyValue ([int]$map.wait_after_ms) -Force }
 
         # 出力: {論理名}_{大分類} フォルダに {宛名番号}_{大分類}_{小分類}_{ページ名}.png
         $folder = Join-Path $runDir (ConvertTo-SafeFileName "${recName}_${dai}")

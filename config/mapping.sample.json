@@ -2,6 +2,7 @@
   "output_dir": "output",
   "max_consecutive_fail": 5,
   "interval_ms": 1000,
+  "wait_after_ms": 5000,
   "records": {
     "印鑑": "config/rec_inkan.json"
   },

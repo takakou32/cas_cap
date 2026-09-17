@@ -17,6 +17,9 @@
   .tabs { display: flex; gap: 4px; margin: 12px 0; }
   .tab { border: 1px solid #999; padding: 4px 12px; cursor: pointer; }
   .tab-body { border: 1px solid #ccc; padding: 12px; }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #ccc; border-top-color: #2d4a6e; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .preview { border: 2px solid #2d4a6e; padding: 24px; background: #fffbe6; }
 </style>
 </head>
 <body>
@@ -28,6 +31,8 @@
     3. 候補リストは body 直下の別レイヤーに描かれ、前に入る要素の数やIDが毎回変わる
     4. 候補を選ぶと、表示名を入力欄へ書き戻して change を発火する
     5. 選択後、少し遅れて画面が変わる。URL には宛名番号ではなく世帯番号と内部キーが入る
+    6. 「帳票」タブを押すと帳票プレビューの作成が始まり、約3秒「くるくる」が出る。くるくるは回るだけで
+       画面の中身（DOM）を変えない。作成中はメニュー（宛名検索）を押しても効かない
   ?label=name を付けると、候補の表示名が氏名だけ（宛名番号なし）になる。
   画面の動きは window.__mockLog に積まれる（検証用）。
 -->
@@ -43,6 +48,7 @@
     { atena: '333333', name: '鈴木 一郎', setai: '90003', key: 'k9d8' }
   ];
   window.__mockLog = [];
+  var busy = false;
   var overlay = null, timer = null;
 
   function rid() { return 'pv_id_' + Math.floor(Math.random() * 1000); }
@@ -64,11 +70,12 @@
       view.innerHTML =
         '<section class="detail"><h2>宛名詳細</h2>' +
         '<p class="person">宛名番号 <span class="atena">' + p.atena + '</span> ／ 氏名 <span class="name">' + p.name + '</span></p>' +
-        '<div class="tabs"><div class="tab" data-tab="基本">基本</div><div class="tab" data-tab="履歴">履歴</div><div class="tab" data-tab="世帯">世帯</div></div>' +
+        '<div class="tabs"><div class="tab" data-tab="基本">基本</div><div class="tab" data-tab="履歴">履歴</div><div class="tab" data-tab="世帯">世帯</div><div class="tab" data-tab="帳票">帳票</div></div>' +
         '<div class="tab-body">基本: ' + p.name + '</div></section>';
       window.__mockLog.push({ view: 'detail', atena: p.atena });
       Array.prototype.forEach.call(view.querySelectorAll('.tab'), function (t) {
         t.addEventListener('click', function () {
+          if (t.dataset.tab === '帳票') { startPreview(view, p); return; }
           view.querySelector('.tab-body').textContent = t.dataset.tab + ': ' + p.name;
           window.__mockLog.push({ view: 'tab', atena: p.atena, tab: t.dataset.tab });
         });
@@ -137,6 +144,24 @@
     // くせ5: 少し遅れて遷移。URL には世帯番号と内部キー
     setTimeout(function () { location.hash = '#/detail?setai=' + p.setai + '&k=' + p.key; }, 500);
   }
+
+  // くせ6: 帳票プレビューの作成。くるくるを出したら、完成までDOMは変えない
+  function startPreview(view, p) {
+    var body = view.querySelector('.tab-body');
+    busy = true;
+    body.innerHTML = '<span class="spinner"></span> 帳票プレビュー作成中…';
+    window.__mockLog.push({ view: 'preview-start', atena: p.atena });
+    setTimeout(function () {
+      busy = false;
+      if (!document.body.contains(body)) return;
+      body.innerHTML = '<div class="preview">帳票プレビュー<br>宛名番号 ' + p.atena + ' ／ 氏名 ' + p.name + '</div>';
+      window.__mockLog.push({ view: 'preview', atena: p.atena });
+    }, 3000);
+  }
+  // 作成中はメニューを押しても効かない
+  document.querySelector('.nav-link').addEventListener('click', function (e) {
+    if (busy) { e.preventDefault(); window.__mockLog.push({ view: 'ignored' }); }
+  });
 
   window.addEventListener('hashchange', render);
   render();

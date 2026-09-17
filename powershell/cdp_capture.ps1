@@ -919,6 +919,9 @@ function Invoke-Capture {
                     Write-Warning "ページ '$name' の操作中にエラー(撮影は継続): $_"
                 }
 
+                # 記録終了時に「撮らない」とされたページ（最後の撮影より後の操作）は操作だけ行う
+                if ($null -ne $pageConf.capture -and -not [bool]$pageConf.capture) { continue }
+
                 $filename = Join-Path $outputDir "${prefix}_${name}.png"
                 try {
                     Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
@@ -1317,14 +1320,15 @@ function Get-RecActionDesc {
 # 記録した手順を番号つきで並べ、番号をカンマ区切りで聞く。選ばれた手順の添字(0始まり)の一覧を返す。
 #   $Answer を渡した時は聞かずにそれを使う（テスト・自動化用）。Enterのみ（空）なら「なし」。
 #   不正な番号（数字以外・範囲外）は警告を出し、その番号だけ無視する（黙って採用しない）。
+#   $EnterHint: Enterのみの時にどうなるかの案内（入力欄の説明に出す）
 function Read-StepNumbers {
-    param([string]$Question, $Steps, $Answer = $null)
+    param([string]$Question, $Steps, $Answer = $null, [string]$EnterHint = "設定しない")
     Write-Host ""
     Write-Host "$Question（全 $($Steps.Count) 手順）"
     for ($n = 0; $n -lt $Steps.Count; $n++) {
         Write-Host ("{0,3}: [{1}] {2}" -f ($n + 1), $Steps[$n].Page, (Get-RecActionDesc -Action $Steps[$n].Action))
     }
-    $ans = if ($null -ne $Answer) { [string]$Answer } else { Read-Host "番号をカンマ区切りで入力（Enterで設定しない）" }
+    $ans = if ($null -ne $Answer) { [string]$Answer } else { Read-Host "番号をカンマ区切りで入力（Enterで$EnterHint）" }
     $picked = New-Object System.Collections.ArrayList
     if ($ans) {
         foreach ($tok in ($ans -split ',')) {
@@ -1341,10 +1345,33 @@ function Read-StepNumbers {
     return ,$picked
 }
 
+# 画面コピーを取る手順で、撮影ポイント（ページ）を組み直す。
+#   選ばれた手順の後で1枚撮るように、先頭からその手順までを1ページにまとめる。
+#   最後に選ばれた手順より後の操作は、撮らないページ（capture=false）として残す
+#   （プレビューを閉じる等、次の件のために必要な操作かもしれないため）。
+function Group-RecPagesByCapture {
+    param($Steps, $Picked, [string]$PageName)
+    $newPages = New-Object System.Collections.ArrayList
+    $acts = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Steps.Count; $i++) {
+        [void]$acts.Add($Steps[$i].Action)
+        if ($Picked -contains $i) {
+            $name = "{0}_{1:D3}" -f $PageName, ($newPages.Count + 1)
+            [void]$newPages.Add([ordered]@{ name = $name; actions = $acts })
+            $acts = New-Object System.Collections.ArrayList
+        }
+    }
+    if ($acts.Count -gt 0) {
+        $name = "{0}_{1:D3}" -f $PageName, ($newPages.Count + 1)
+        [void]$newPages.Add([ordered]@{ name = $name; actions = $acts; capture = $false })
+    }
+    return ,$newPages
+}
+
 function Complete-Recording {
-    # $WaitAfterAnswer / $ByIndexAnswer: 記録終了時の質問の答え。渡さなければその場で聞く
+    # $CaptureAnswer / $WaitAfterAnswer / $ByIndexAnswer: 記録終了時の質問の答え。渡さなければその場で聞く
     param($Cfg, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "",
-          $WaitAfterAnswer = $null, $ByIndexAnswer = $null)
+          $WaitAfterAnswer = $null, $ByIndexAnswer = $null, $CaptureAnswer = $null)
 
     # 未解決の保留クリックはページ内クリックとして確定し、残った入力も最後のページとして確定
     Resolve-PendingClick -Verbose $false
@@ -1383,6 +1410,36 @@ function Complete-Recording {
     $steps = New-Object System.Collections.ArrayList
     foreach ($pg in $pages) {
         foreach ($a in $pg.actions) { [void]$steps.Add([pscustomobject]@{ Page = $pg.name; Action = $a }) }
+    }
+
+    # 画面コピーを取る場所を人が選ぶ。選ばなければ従来どおり、クリック・画面遷移ごとに1枚撮る。
+    $captureIdx = Read-StepNumbers -Question "画面コピーを取るのはどの操作の後ですか？" -Steps $steps -Answer $CaptureAnswer -EnterHint "すべての画面（クリック・画面遷移ごと）"
+    if ($captureIdx.Count -eq 0) {
+        Write-Host "  画面コピー: すべての画面（$($pages.Count) 枚）"
+    } else {
+        foreach ($i in ($captureIdx | Sort-Object)) {
+            Write-Host "  画面コピー: 手順 $($i + 1) $(Get-RecActionDesc -Action $steps[$i].Action) の後"
+        }
+        Write-Host "  （操作後の待ちを付けた手順では、待ってから撮ります）"
+    }
+
+    # 画面コピーを取る手順が選ばれていれば、そこで撮るようにページを組み直す
+    if ($captureIdx.Count -gt 0) {
+        $pages = Group-RecPagesByCapture -Steps $steps -Picked $captureIdx -PageName $script:RecPageName
+        Write-Host ""
+        Write-Host "撮影する画面: $(@($pages | Where-Object { $null -eq $_.capture }).Count) 枚"
+        $no = 0
+        foreach ($pg in $pages) {
+            # 後の質問の一覧に、組み直した後のページ名を出す
+            for ($k = $no; $k -lt $no + $pg.actions.Count; $k++) { $steps[$k].Page = $pg.name }
+            $cnt = $pg.actions.Count
+            $from = $no + 1; $no += $cnt
+            if ($null -eq $pg.capture) {
+                Write-Host "  $($pg.name): 手順 $from～$no の後に撮る"
+            } else {
+                Write-Host "  （手順 $from～$no は操作だけして撮らない）"
+            }
+        }
     }
 
     # 「押しても効かない時間」「作成中を撮ってしまう」画面への対策（cas_auto_report の wait_after と同じ）。

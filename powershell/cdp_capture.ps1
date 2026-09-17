@@ -68,6 +68,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:CdpId = 0
+$script:BatchMode = $false   # バッチ実行中か（本物の入力で操作し、合わなければその件を打ち切る）
 
 # .NET の相対パス基準(WriteAllBytes等)を PowerShell のカレントに合わせる。
 # これをしないと、別ディレクトリから起動した際に出力先がずれる。
@@ -261,6 +262,241 @@ new Promise((resolve) => {
 }
 
 # ---------------------------------------------------------------------------
+# バッチ実行時の操作（本物のマウス操作・キー入力）
+#   業務システムの部品には、プログラムから投げたイベントでは反応しないものがある
+#   （キーを離した時だけ検索する／マウスを押した瞬間に候補を選ぶ 等）。
+#   バッチ用記録の再生では、人と同じ入力を Edge に送る。
+# ---------------------------------------------------------------------------
+
+# 画面上の座標をマウスでクリックする（移動 → 押す → 離す）
+function Send-MouseClick {
+    param($Ws, [double]$X, [double]$Y)
+    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mouseMoved"; x = $X; y = $Y } | Out-Null
+    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mousePressed"; x = $X; y = $Y; button = "left"; buttons = 1; clickCount = 1 } | Out-Null
+    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchMouseEvent" -Params @{ type = "mouseReleased"; x = $X; y = $Y; button = "left"; buttons = 0; clickCount = 1 } | Out-Null
+}
+
+# 文字を入力しないキー（Backspace など）を押して離す
+function Send-KeyStroke {
+    param($Ws, [string]$Key, [string]$Code, [int]$KeyCode, [int]$Modifiers = 0)
+    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params @{ type = "rawKeyDown"; key = $Key; code = $Code; windowsVirtualKeyCode = $KeyCode; modifiers = $Modifiers } | Out-Null
+    Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params @{ type = "keyUp"; key = $Key; code = $Code; windowsVirtualKeyCode = $KeyCode; modifiers = $Modifiers } | Out-Null
+}
+
+# 文字列を1文字ずつキー入力する（キーを押す → 離す）
+function Send-KeyText {
+    param($Ws, [string]$Text)
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [string]$ch
+        $down = @{ type = "keyDown"; key = $c; text = $c }
+        $up   = @{ type = "keyUp"; key = $c }
+        $code = $null; $keyCode = 0
+        if ($c -match '^[0-9]$') { $code = "Digit$c"; $keyCode = 48 + [int]$c }
+        elseif ($c -match '^[A-Za-z]$') { $code = "Key$($c.ToUpper())"; $keyCode = [int][char]($c.ToUpper()) }
+        if ($code) {
+            $down.code = $code; $down.windowsVirtualKeyCode = $keyCode
+            $up.code = $code;   $up.windowsVirtualKeyCode = $keyCode
+        }
+        Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params $down | Out-Null
+        Invoke-CdpCommand -Ws $Ws -Method "Input.dispatchKeyEvent" -Params $up | Out-Null
+        Start-Sleep -Milliseconds 30
+    }
+}
+
+# 操作対象に付けた目印（data-cap-target）を外す
+$script:ClearTargetMarkJs = @'
+(function(){ Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); }); return true; })()
+'@
+
+# 目印を付けた要素を、座標が他の要素に隠れていたときだけ直接クリックする
+$script:ClickMarkedTargetJs = @'
+(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.removeAttribute('data-cap-target'); e.click(); return true; })()
+'@
+
+# バッチ実行のクリック。見つからない・特定できないときは例外（＝その件を打ち切る）。
+#   ボタン名に宛名番号が入っていたクリック（match_kojin_no あり）
+#     → 宛名番号を含む要素だけで探す。氏名や位置では選ばない（別人の候補を押さないため）
+#   それ以外
+#     → 記録位置＋ボタン名 → ボタン名 →（ボタン名が無い時のみ）記録位置
+#     → それでも無ければ、記録した要素と同じ種類（位置の番号は無視）が画面に1つだけならそれ
+function Invoke-BatchClick {
+    param($Ws, $Action)
+    $findJs = @'
+new Promise(function (resolve) {
+  var sel = __SEL__, text = __TXT__, no = __NO__, deadline = Date.now() + __TO__, started = Date.now(), singleSeen = 0, sameCount = 0;
+  var CLICKABLE = 'a,button,[role=button],[role=tab],[role=menuitem],[role=link],[role=option],li,[tabindex],[onclick]';
+  function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
+  function txtOf(e){
+    var s=(e.innerText||e.textContent||'').trim();
+    if(!s){ try { s=((e.getAttribute('aria-label')||e.getAttribute('title'))||'').trim(); } catch(_){} }
+    return s;
+  }
+  function matches(a,b){
+    if(!a||!b) return false;
+    if(a===b) return true;
+    return (b.length>=2 && a.indexOf(b)>=0) || (a.length>=2 && b.indexOf(a)>=0);
+  }
+  // 前後が英数字でない位置に宛名番号があるか（11111 が 111119 に当たらないように）
+  function hasNo(s){
+    var i = s.indexOf(no);
+    while (i >= 0) {
+      var before = i === 0 ? '' : s.charAt(i - 1), after = s.charAt(i + no.length);
+      if (!/[0-9A-Za-z]/.test(before) && !/[0-9A-Za-z]/.test(after)) return true;
+      i = s.indexOf(no, i + 1);
+    }
+    return false;
+  }
+  function all(q){ try { return Array.prototype.slice.call(document.querySelectorAll(q)).filter(visible); } catch(e){ return []; } }
+  (function check(){
+    var el = null; try { el = document.querySelector(sel); } catch(e){}
+    var target = null, how = '', ambiguous = false;
+    if (no) {
+      if (visible(el) && hasNo(txtOf(el))) { target = el; how = 'number'; }
+      else {
+        var hits = all(CLICKABLE).filter(function(e){ return hasNo(txtOf(e)); });
+        // 入れ子（候補の行と、その中のリンク等）は内側を優先
+        hits = hits.filter(function(e){ return !hits.some(function(o){ return o !== e && e.contains(o); }); });
+        if (hits.length === 1) { target = hits[0]; how = 'number'; }
+        else if (hits.length > 1) { ambiguous = true; }
+      }
+    } else {
+      if (visible(el) && (!text || matches(txtOf(el), text))) { target = el; how = 'recorded'; }
+      else {
+        var byText = null;
+        if (text) {
+          var list = all(CLICKABLE);
+          byText = list.find(function(e){ return txtOf(e) === text; }) || list.find(function(e){ return matches(txtOf(e), text); });
+        }
+        if (byText) { target = byText; how = 'text'; }
+        else if (!text && visible(el)) { target = el; how = 'notext'; }
+        else if (text && Date.now() - started >= 1000) {
+          // 描画途中の一瞬を拾わないよう、1秒待ってから2回続けて1件だった時だけ採用
+          var same = all(sel.replace(/:nth-of-type\(\d+\)/g, ''));
+          sameCount = same.length;
+          if (same.length === 1) { singleSeen++; if (singleSeen >= 2) { target = same[0]; how = 'single'; } }
+          else { singleSeen = 0; }
+        }
+      }
+    }
+    if (target) {
+      Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); });
+      target.setAttribute('data-cap-target', '1');
+      target.scrollIntoView({ block: 'center', inline: 'center' });
+      var r = target.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+      var hit = document.elementFromPoint(x, y);
+      var covered = !(hit && (hit === target || target.contains(hit)));
+      return resolve(JSON.stringify({ status: 'found', how: how, x: x, y: y, covered: covered, label: txtOf(target).slice(0, 40) }));
+    }
+    if (Date.now() > deadline) return resolve(JSON.stringify({ status: ambiguous ? 'ambiguous' : (sameCount > 1 ? 'ambiguous-same' : 'notfound'), count: sameCount }));
+    setTimeout(check, 150);
+  })();
+})
+'@
+    $no = if ($Action.match_kojin_no) { [string]$Action.match_kojin_no } else { "" }
+    $expr = $findJs.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
+    $expr = $expr.Replace('__TXT__', (ConvertTo-JsLiteral ([string]$Action.text)))
+    $expr = $expr.Replace('__NO__', (ConvertTo-JsLiteral $no))
+    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
+    $st = (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true) | ConvertFrom-Json
+
+    if ($st.status -eq 'ambiguous') {
+        throw "宛名番号 $no を含む候補が複数あり、1つに決められません: $($Action.selector)"
+    }
+    if ($st.status -eq 'ambiguous-same') {
+        throw "ボタン名 '$($Action.text)' が見つからず、同じ種類の要素が $($st.count) 件あって1つに決められません: $($Action.selector)"
+    }
+    if ($st.status -ne 'found') {
+        if ($no) { throw "宛名番号 $no を含むクリック対象が見つかりません: $($Action.selector)" }
+        throw "クリック対象が見つかりません: $($Action.selector) (ボタン名: $($Action.text))"
+    }
+
+    if ($st.covered) {
+        # 座標に別の要素が重なっていてマウスが届かない → 要素を直接クリック
+        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClickMarkedTargetJs | Out-Null
+        $method = "直接"
+    } else {
+        Send-MouseClick -Ws $Ws -X ([double]$st.x) -Y ([double]$st.y)
+        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClearTargetMarkJs | Out-Null
+        $method = "マウス"
+    }
+    $how = switch ($st.how) {
+        'number'   { "宛名番号一致" }
+        'recorded' { "記録位置" }
+        'text'     { "ボタン名一致" }
+        'notext'   { "記録位置(ボタン名なし)" }
+        'single'   { "同じ種類が1件のみ" }
+        default    { $st.how }
+    }
+    Write-Host "  (クリック[$method/$how]: $($st.label))"
+}
+
+# バッチ実行の入力。欄をクリックして既存の値を消し、1文字ずつキー入力する。
+function Invoke-BatchFill {
+    param($Ws, $Action)
+    $findJs = @'
+new Promise(function (resolve) {
+  var sel = __SEL__, deadline = Date.now() + __TO__;
+  (function check(){
+    var el = null; try { el = document.querySelector(sel); } catch(e){}
+    if (el) {
+      Array.prototype.forEach.call(document.querySelectorAll('[data-cap-target]'), function(e){ e.removeAttribute('data-cap-target'); });
+      el.setAttribute('data-cap-target', '1');
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+      var hit = document.elementFromPoint(x, y);
+      var covered = !(hit && (hit === el || el.contains(hit)));
+      return resolve(JSON.stringify({ status: 'found', x: x, y: y, covered: covered }));
+    }
+    if (Date.now() > deadline) return resolve(JSON.stringify({ status: 'notfound' }));
+    setTimeout(check, 150);
+  })();
+})
+'@
+    # 欄にフォーカスして全選択し、今の値の長さを返す
+    $selectAllJs = @'
+(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return -1; if(document.activeElement!==e) e.focus(); try { e.select(); } catch(_){} return (e.value||'').length; })()
+'@
+    $valueJs = @'
+(function(){ var e=document.querySelector('[data-cap-target]'); return e ? (e.value||'') : ''; })()
+'@
+    $clearByScriptJs = @'
+(function(){ var e=document.querySelector('[data-cap-target]'); if(!e) return false; e.value=''; e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()
+'@
+    $expr = $findJs.Replace('__SEL__', (ConvertTo-JsLiteral ([string]$Action.selector)))
+    $expr = $expr.Replace('__TO__', [string]$script:ActionTimeoutMs)
+    $st = (Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true) | ConvertFrom-Json
+    if ($st.status -ne 'found') { throw "入力対象が見つかりません: $($Action.selector)" }
+
+    try {
+        # 人と同じく欄をクリックしてから打つ（隠れている時はフォーカスだけ）
+        if (-not $st.covered) { Send-MouseClick -Ws $Ws -X ([double]$st.x) -Y ([double]$st.y) }
+        $len = [int](Invoke-PageScriptSafe -Ws $Ws -Expression $selectAllJs)
+        if ($len -lt 0) { throw "入力対象が見つかりません: $($Action.selector)" }
+        if ($len -gt 0) {
+            Send-KeyStroke -Ws $Ws -Key "Backspace" -Code "Backspace" -KeyCode 8
+            if ((Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs) -ne "") {
+                # 全選択が効かない欄 → Ctrl+A → Backspace、それでも残れば値を直接消す
+                Send-KeyStroke -Ws $Ws -Key "a" -Code "KeyA" -KeyCode 65 -Modifiers 2
+                Send-KeyStroke -Ws $Ws -Key "Backspace" -Code "Backspace" -KeyCode 8
+                if ((Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs) -ne "") {
+                    Invoke-PageScriptSafe -Ws $Ws -Expression $clearByScriptJs | Out-Null
+                }
+            }
+        }
+
+        $value = [string]$Action.value
+        Send-KeyText -Ws $Ws -Text $value
+        $actual = [string](Invoke-PageScriptSafe -Ws $Ws -Expression $valueJs)
+        Write-Host "  (入力[キー入力]: $($Action.selector) = $value → 欄の値: $actual)"
+        if ($actual.Trim() -ne $value.Trim()) {
+            Write-Warning "入力後の欄の値が記録と違います（期待: $value / 実際: $actual）。書式を整える欄なら問題ありません。"
+        }
+    } finally {
+        Invoke-PageScriptSafe -Ws $Ws -Expression $script:ClearTargetMarkJs | Out-Null
+    }
+}
+
+# ---------------------------------------------------------------------------
 # アクション実行
 # ---------------------------------------------------------------------------
 function Invoke-CapAction {
@@ -268,17 +504,17 @@ function Invoke-CapAction {
 
     switch ($Action.type) {
         "click" {
+            # バッチ実行は本物のマウス操作＋宛名番号での照合（見つからなければその件を打ち切る）
+            if ($script:BatchMode) { Invoke-BatchClick -Ws $Ws -Action $Action; break }
+
             # ハイブリッド特定：セレクタで当てた要素を「記録時のボタン名(text/aria-label)」で検証する。
             # 権限差などでDOMの順番が変わり、位置セレクタが“別要素”に当たった場合はラベルで探し直す。
-            # click_nav(宛名番号差し替え運用)の記録では、サジェスト候補の表示名(氏名)が番号ごとに
-            # 変わるため、ラベル不一致でもセレクタ位置の要素をクリックして進む。
             $sel = ConvertTo-JsLiteral $Action.selector
             $txt = ConvertTo-JsLiteral ([string]$Action.text)
             $to  = $script:ActionTimeoutMs
-            $lenient = if ($script:ClickNavMode) { "true" } else { "false" }
             $expr = @"
 new Promise((resolve) => {
-  const sel = $sel, text = $txt, deadline = Date.now() + $to, lenient = $lenient;
+  const sel = $sel, text = $txt, deadline = Date.now() + $to;
   function visible(e){ return e && (e.offsetParent !== null || (e.getClientRects && e.getClientRects().length > 0)); }
   function txtOf(e){
     var s=(e.innerText||e.textContent||'').trim();
@@ -304,8 +540,8 @@ new Promise((resolve) => {
     // 2) ラベル一致の要素を探す（順番が変わっても“ボタン名”で当てる）
     var c = byText();
     if (c) return go(c, 'text');
-    // 3) テキスト情報が無い時（アイコン等）、または click_nav 記録の時は位置一致のセレクタ要素をクリック
-    if (visible(el) && (!text || lenient)) return go(el, text ? 'clicked-position' : 'clicked-notext');
+    // 3) テキスト情報が無い時（アイコン等）は位置一致のセレクタ要素をクリック
+    if (visible(el) && !text) return go(el, 'clicked-notext');
     // 4) テキストはあるが一致要素が無い → まだ描画中かもしれないので待つ
     if (Date.now() > deadline) return resolve('notfound');
     setTimeout(check, 150);
@@ -314,13 +550,15 @@ new Promise((resolve) => {
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
             switch ($st) {
-                'notfound'         { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
-                'text'             { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
-                'clicked-position' { Write-Host "  (位置でクリック: $($Action.selector))" }
+                'notfound'       { Write-Warning "クリック対象が見つかりません(スキップ): $($Action.selector)" }
+                'text'           { Write-Host "  (ボタン名一致でクリック: $($Action.text))" }
                 'clicked-notext' { Write-Host "  (位置一致でクリック: $($Action.selector))" }
             }
         }
         "fill" {
+            # バッチ実行は本物のキー入力（キーを離した時に検索する部品でも候補が出るように）
+            if ($script:BatchMode) { Invoke-BatchFill -Ws $Ws -Action $Action; break }
+
             $sel = ConvertTo-JsLiteral $Action.selector
             $val = ConvertTo-JsLiteral $Action.value
             $to  = $script:ActionTimeoutMs
@@ -407,7 +645,10 @@ new Promise((resolve) => {
 })
 "@
             $st = Invoke-PageScriptSafe -Ws $Ws -Expression $expr -AwaitPromise $true
-            if ($st -eq 'notfound') { Write-Warning "選択対象が見つかりません(スキップ): $($Action.selector)" }
+            if ($st -eq 'notfound') {
+                if ($script:BatchMode) { throw "選択対象が見つかりません: $($Action.selector)" }
+                Write-Warning "選択対象が見つかりません(スキップ): $($Action.selector)"
+            }
         }
         "keyboard" {
             $key = ConvertTo-JsLiteral $Action.key
@@ -750,8 +991,6 @@ function Invoke-Capture {
 
     # SPA(Vue等)の認証付きシステム向け: goto をリロードせず pushState で行う
     $script:SpaMode = if ($null -ne $Cfg.spa_mode) { [bool]$Cfg.spa_mode } else { $false }
-    # 宛名番号差し替え運用の記録(-ClickNav で記録)か
-    $script:ClickNavMode = if ($null -ne $Cfg.click_nav) { [bool]$Cfg.click_nav } else { $false }
 
     if (-not (Test-Path $outputDir)) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -797,6 +1036,8 @@ function Invoke-Capture {
                     }
                     Wait-PageReady -Ws $ws -SettleMs $settleMs
                 } catch {
+                    # バッチ実行は、ずれた画面のまま撮り続けないよう、その件をここで打ち切る
+                    if ($script:BatchMode) { throw "ページ '$name'（$($i + 1)/$($pagesCfg.Count)）で打ち切り: $($_.Exception.Message)" }
                     Write-Warning "ページ '$name' の操作中にエラー(撮影は継続): $_"
                 }
 
@@ -805,6 +1046,7 @@ function Invoke-Capture {
                     Save-Screenshot -Ws $ws -Path $filename -FullPage $fullPage
                     Write-Host "キャプチャ保存: $filename"
                 } catch {
+                    if ($script:BatchMode) { throw "ページ '$name'（$($i + 1)/$($pagesCfg.Count)）の撮影に失敗: $($_.Exception.Message)" }
                     Write-Warning "ページ '$name' の撮影に失敗(スキップ): $_"
                 }
             }
@@ -922,15 +1164,45 @@ $script:RecorderJs = @'
     }
     return "";
   }
-  var clickH = function(e){
-    var t=clickTarget(e.target);
-    if(!t) return;
+  // テキスト入力欄へのクリックは記録しない（入力は fill で扱う）
+  function isTypingTarget(t){
     var tg=(t.tagName||"").toLowerCase();
-    if(tg==="input"||tg==="textarea"){
-      var ty=(t.type||"").toLowerCase();
-      if(ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio") return; // テキスト入力はfillで扱う
+    if(tg!=="input"&&tg!=="textarea") return false;
+    var ty=(t.type||"").toLowerCase();
+    return ty!=="submit"&&ty!=="button"&&ty!=="checkbox"&&ty!=="radio";
+  }
+  function shown(e){ return e && (e.offsetParent!==null || (e.getClientRects && e.getClientRects().length>0)); }
+  // マウスを押した時点の対象を覚えておく。サジェスト候補のように「押した瞬間に選ばれて消える」部品では
+  // click が候補に届かないため、押した時点の要素で記録する。
+  var pressed = null;
+  var downH = function(e){
+    pressed = null;
+    if (e.button !== undefined && e.button !== 0) return;
+    var t=clickTarget(e.target);
+    if(!t || isTypingTarget(t)) return;
+    pressed = { el:t, selector:cssPath(t), text:labelOf(t), ts:Date.now(), used:false };
+  };
+  var clickH = function(e){
+    if (pressed && !pressed.used && Date.now() - pressed.ts < 1500) {
+      pressed.used = true;
+      push({type:"click", selector:pressed.selector, text:pressed.text});
+      return;
     }
+    var t=clickTarget(e.target);
+    if(!t || isTypingTarget(t)) return;
     push({type:"click", selector:cssPath(t), text:labelOf(t)});
+  };
+  var upH = function(){
+    var p = pressed;
+    if (!p) return;
+    // click は mouseup の直後に届く。届かないまま押した要素が消えていたら、押した要素で記録する
+    setTimeout(function(){
+      if (!p.used && (!p.el.isConnected || !shown(p.el))) {
+        p.used = true;
+        push({type:"click", selector:p.selector, text:p.text});
+      }
+      if (pressed === p) pressed = null;
+    }, 50);
   };
   // テキスト系の入力欄か（チェックボックス等はクリックで記録、パスワードは記録ファイルに残さない）
   function isTextField(el){
@@ -942,26 +1214,48 @@ $script:RecorderJs = @'
   var changeH = function(e){
     var el=e.target; var tag=(el.tagName||"").toLowerCase();
     if(tag==="select"){ push({type:"select", selector:cssPath(el), value:el.value}); }
-    else if(isTextField(el)){ push({type:"fill", selector:cssPath(el), value:el.value}); }
+    else if(isTextField(el)){
+      // 人がキー入力した欄の change は記録しない（値は input で記録済み）。
+      // サジェスト候補を選んだ後に部品が書き戻す「番号＋氏名」などを拾わないため。
+      // キー入力なしで値が変わった欄（日付選択など）の change は記録する。
+      // 部品が自分で change を投げた後に、欄を離れた時の change がもう一度来ることがあるので、
+      // 目印は change では消さず、欄に次にフォーカスが入った時に消す。
+      if (el.__capTyped) return;
+      push({type:"fill", selector:cssPath(el), value:el.value});
+    }
   };
-  // 入力中の値も拾う。サジェスト候補のクリックでは change がクリックより後になる／発火しないことがあり、
+  // 欄にフォーカスが入ったら「キー入力済み」の目印を消す（新しい入力の始まり）
+  var focusH = function(e){
+    var el=e.target;
+    if(el && isTextField(el)){ el.__capTyped = false; }
+  };
+  // 人のキー入力。サジェスト候補のクリックでは change がクリックより後になる／発火しないことがあり、
   // 宛名番号の入力が記録から漏れるのを防ぐ（同じ欄の連続入力は記録側で最後の値にまとめる）。
   var inputH = function(e){
     var el=e.target;
-    if(isTextField(el)){ push({type:"fill", selector:cssPath(el), value:el.value}); }
+    if(isTextField(el)){ el.__capTyped = true; push({type:"fill", selector:cssPath(el), value:el.value}); }
   };
 
   // 古いハンドラがあれば除去して最新を付け直す。
   // これにより「ページを開いたまま録り直し」ても古いcssPath実装が残らない。
-  try { if(window.__capClickH)  document.removeEventListener("click",  window.__capClickH,  true); } catch(e){}
-  try { if(window.__capChangeH) document.removeEventListener("change", window.__capChangeH, true); } catch(e){}
-  try { if(window.__capInputH)  document.removeEventListener("input",  window.__capInputH,  true); } catch(e){}
+  try { if(window.__capClickH)  document.removeEventListener("click",       window.__capClickH,  true); } catch(e){}
+  try { if(window.__capChangeH) document.removeEventListener("change",      window.__capChangeH, true); } catch(e){}
+  try { if(window.__capInputH)  document.removeEventListener("input",       window.__capInputH,  true); } catch(e){}
+  try { if(window.__capDownH)   document.removeEventListener("pointerdown", window.__capDownH,   true); } catch(e){}
+  try { if(window.__capUpH)     document.removeEventListener("pointerup",   window.__capUpH,     true); } catch(e){}
+  try { if(window.__capFocusH)  document.removeEventListener("focusin",     window.__capFocusH,  true); } catch(e){}
   window.__capClickH = clickH;
   window.__capChangeH = changeH;
   window.__capInputH = inputH;
-  document.addEventListener("click",  clickH,  true);
-  document.addEventListener("change", changeH, true);
-  document.addEventListener("input",  inputH,  true);
+  window.__capDownH = downH;
+  window.__capUpH = upH;
+  window.__capFocusH = focusH;
+  document.addEventListener("focusin",     focusH,  true);
+  document.addEventListener("pointerdown", downH,   true);
+  document.addEventListener("pointerup",   upH,     true);
+  document.addEventListener("click",       clickH,  true);
+  document.addEventListener("change",      changeH, true);
+  document.addEventListener("input",       inputH,  true);
 })();
 '@
 
@@ -1068,6 +1362,7 @@ function Add-RecordSample {
             $script:RecPending.Clear()
             $script:RecPendingClick = @{ action = $clickAct; inputs = $snap }
             $script:RecClickArmed = 3
+            $script:RecLastClickTime = Get-Date
         }
         elseif ($e.type -eq "fill" -or $e.type -eq "select") {
             # 入力は次の撮影ポイントまで保留（同一セレクタは最後の値で上書き）
@@ -1099,10 +1394,21 @@ function Add-RecordSample {
             try { $sameOrigin = (([Uri]$url).GetLeftPart([System.UriPartial]::Authority) -eq ([Uri]$script:RecLastUrl).GetLeftPart([System.UriPartial]::Authority)) } catch {}
             if ($sameOrigin -and [int]$obj.load -le $script:RecLastLoad) { $script:RecSawSpa = $true }
         }
-        if ($script:RecClickNav -and $script:RecPendingClick) {
-            # バッチ用記録(-ClickNav): 遷移を起こしたクリックを click のまま残す。
-            # 宛名番号を入力 → サジェスト候補をクリック、で遷移先が番号に応じて変わるようにする。
-            Resolve-PendingClick -Verbose $Verbose
+        if ($script:RecClickNav) {
+            # バッチ用記録(-ClickNav): URL での移動(goto)は一切記録しない。
+            # URL には宛名番号以外の番号（世帯番号など）が入り、別の人の画面を開いてしまうことがあるため。
+            if ($script:RecPendingClick) {
+                # 遷移を起こしたクリックを click のまま残す（入力した宛名番号に応じて遷移先が変わる）
+                Resolve-PendingClick -Verbose $Verbose
+            } elseif ($script:RecLastUrl) {
+                # 直前にクリックが無いのに画面が変わった（戻る・アドレス入力など）。
+                # 候補選択の後にサーバ応答を待って遅れて遷移する場合もあるので、直近のクリックから10秒以内は対象外。
+                $recent = $script:RecLastClickTime -and ((Get-Date) - $script:RecLastClickTime).TotalSeconds -lt 10
+                if (-not $recent) {
+                    $script:RecNavWarnings++
+                    Write-Warning "クリックを伴わない画面遷移がありました（戻る・アドレス入力など）。バッチでは再生できないため記録しません。画面内のボタンやメニューで操作してください。"
+                }
+            }
         } else {
             # 遷移が起きた → 宛先URLへの goto を撮影ポイントに。
             # （保留クリックがあればそれが起こした遷移なので、click は破棄し goto で確実に再現する。
@@ -1138,6 +1444,79 @@ function Resolve-PendingClick {
     Add-RecPage -Action $pc.action -Inputs $pc.inputs -Verbose $Verbose
 }
 
+# 記録の状態を初期化する
+function Initialize-RecordingState {
+    param([string]$PageName, [bool]$ClickNav = $false)
+    $script:RecPages         = New-Object System.Collections.ArrayList  # 確定した撮影ページ（順序どおり）
+    $script:RecPending       = New-Object System.Collections.ArrayList  # 次の撮影ポイントまで保留する入力
+    $script:RecLastUrl       = $null
+    $script:RecPendingClick  = $null     # 後決め用に保留中のクリック（goto か click かは後で確定）
+    $script:RecClickArmed    = 0         # クリック起因の遅延遷移を紐付ける残り猶予ポーリング数
+    $script:RecLastLoad      = 0         # 直近のドキュメントロード回数
+    $script:RecSawSpa        = $false    # SPAソフト遷移を1度でも検出したか
+    $script:RecPageName      = $PageName
+    $script:RecIdx           = 0
+    $script:RecClickNav      = $ClickNav # バッチ用記録: URLが変わるクリックも click のまま残し、goto は作らない
+    $script:RecEmittedInputs = @{}       # ページに確定済みの入力（セレクタ → 値）。後着 change の二重記録防止
+    $script:RecLastClickTime = $null     # 直近のクリック時刻（クリックを伴わない遷移の判定用）
+    $script:RecNavWarnings   = 0         # クリックを伴わない遷移の回数（バッチ用記録では再生できない）
+}
+
+# 記録を締めくくって保存する（保留中のクリック/入力の確定・バッチ用記録の点検・保存）
+function Complete-Recording {
+    param($Cfg, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "")
+
+    # 未解決の保留クリックはページ内クリックとして確定し、残った入力も最後のページとして確定
+    Resolve-PendingClick -Verbose $false
+    Add-RecPage -Action $null -Verbose $false
+
+    $pages = $script:RecPages
+
+    Write-Host ""
+    Write-Host "記録した画面数: $($pages.Count)"
+    if ($script:RecSawSpa) {
+        Write-Host "SPA(クライアントサイド遷移)を検出 → spa_mode=true で保存します（再生時はリロードせず遷移）。"
+    }
+    if ($pages.Count -eq 0) {
+        Write-Host "画面が記録されませんでした。保存はスキップします。"
+        return
+    }
+
+    if ($ClickNav) {
+        $clickCount = 0
+        foreach ($pg in $pages) { foreach ($a in $pg.actions) { if ($a.type -eq "click") { $clickCount++ } } }
+        if ($clickCount -eq 0) {
+            Write-Warning "クリックが1つも記録されませんでした。バッチの手順として成立しないため保存を中止します。"
+            Write-Warning "  メニューのクリックから始めて、確認したい画面まで通しで操作してから Enter を押してください。"
+            return
+        }
+        if ($pages[0].actions[0].type -ne "click") {
+            Write-Warning "記録の最初の操作がクリックではありません。バッチでは件ごとに手順の先頭からやり直すため、"
+            Write-Warning "  どの画面からでも押せるメニュー（検索画面を開くリンク等）のクリックから記録し直してください。"
+        }
+        if ($script:RecNavWarnings -gt 0) {
+            Write-Warning "クリックを伴わない画面遷移が $($script:RecNavWarnings) 回ありました（記録していません）。バッチで同じ画面にたどり着けない可能性があります。"
+        }
+    }
+
+    # バッチ用記録: 指定した宛名番号が記録されているか確認（無いとバッチで差し替えできない）
+    if ($KojinNo) {
+        $hits = Get-KojinNoHitCount -Pages $pages -KojinNo $KojinNo
+        if ($hits -eq 0) {
+            Write-Warning "記録内に宛名番号 '$KojinNo' の入力が見つかりません。このままではバッチで宛名番号を差し替えできません。"
+            Write-Warning "検索欄に宛名番号 '$KojinNo' をそのまま入力して記録し直してください。"
+        } else {
+            Write-Host "宛名番号 '$KojinNo' を記録内で $hits 箇所確認しました（バッチ実行時に差し替えます）。"
+        }
+    } elseif ($ClickNav) {
+        Write-Warning "-KojinNo が未指定です。バッチで使うには記録時の宛名番号を指定してください。"
+    }
+
+    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath -SpaMode $script:RecSawSpa -ClickNav $ClickNav -KojinNo $KojinNo
+    Write-Host "保存先: $OutPath"
+    Write-Host "再生(全画面キャプチャ): .\powershell\cdp_capture.ps1 -Config `"$OutPath`""
+}
+
 function Start-Recording {
     param($Cfg, [string]$PageName, [string]$OutPath, [bool]$ClickNav = $false, [string]$KojinNo = "")
 
@@ -1157,17 +1536,7 @@ function Start-Recording {
     Write-Host "記録対象タブ: $($target.title)"
 
     $ws = Connect-CdpSocket -WsUrl $target.webSocketDebuggerUrl
-    $script:RecPages       = New-Object System.Collections.ArrayList  # 確定した撮影ページ（順序どおり）
-    $script:RecPending     = New-Object System.Collections.ArrayList  # 次の撮影ポイントまで保留する入力
-    $script:RecLastUrl     = $null
-    $script:RecPendingClick = $null  # 後決め用に保留中のクリック（goto か click かは後で確定）
-    $script:RecClickArmed  = 0       # クリック起因の遅延遷移を紐付ける残り猶予ポーリング数
-    $script:RecLastLoad    = 0       # 直近のドキュメントロード回数
-    $script:RecSawSpa      = $false  # SPAソフト遷移を1度でも検出したか
-    $script:RecPageName    = $PageName
-    $script:RecIdx         = 0
-    $script:RecClickNav    = $ClickNav  # バッチ用記録: URLが変わるクリックも click のまま残す
-    $script:RecEmittedInputs = @{}      # ページに確定済みの入力（セレクタ → 値）。後着 change の二重記録防止
+    Initialize-RecordingState -PageName $PageName -ClickNav $ClickNav
     try {
         Invoke-CdpCommand -Ws $ws -Method "Page.enable" | Out-Null
         Invoke-CdpCommand -Ws $ws -Method "Runtime.enable" | Out-Null
@@ -1184,7 +1553,10 @@ function Start-Recording {
         Write-Host "ブラウザを操作してください。クリック（ページ内タブ切替を含む）・画面遷移・入力を順に記録します。"
         Write-Host "各クリック／遷移ごとに1枚キャプチャする設定になります。"
         if ($ClickNav) {
-            Write-Host "[バッチ用記録] 検索欄に宛名番号 $KojinNo を入力し、サジェスト候補をクリックして遷移してください。"
+            Write-Host "[バッチ用記録]"
+            Write-Host "  1. まず、どの画面からでも押せるメニュー（検索画面を開くリンク等）をクリックする"
+            Write-Host "  2. 検索欄に宛名番号 $KojinNo をキーボードで入力し、サジェスト候補をクリックする"
+            Write-Host "  3. 確認したい画面まで、画面内のボタンやタブで操作する（ブラウザの戻る・アドレス入力は使わない）"
         }
         Write-Host "記録を終了するには、このウィンドウで Enter キーを押してください。"
         Write-Host ""
@@ -1205,9 +1577,6 @@ function Start-Recording {
         $json = $null
         try { $json = Invoke-PageScript -Ws $ws -Expression $script:DrainJs } catch { $json = $null }
         Add-RecordSample -Json $json -Verbose $false
-        # 未解決の保留クリックはページ内クリックとして確定
-        Resolve-PendingClick -Verbose $false
-        Add-RecPage -Action $null -Verbose $false
     } finally {
         try {
             $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done",
@@ -1216,34 +1585,7 @@ function Start-Recording {
         $ws.Dispose()
     }
 
-    $pages = $script:RecPages
-
-    Write-Host ""
-    Write-Host "記録した画面数: $($pages.Count)"
-    if ($script:RecSawSpa) {
-        Write-Host "SPA(クライアントサイド遷移)を検出 → spa_mode=true で保存します（再生時はリロードせず遷移）。"
-    }
-    if ($pages.Count -eq 0) {
-        Write-Host "画面が記録されませんでした。保存はスキップします。"
-        return
-    }
-
-    # バッチ用記録: 指定した宛名番号が入力として記録されているか確認（無いとバッチで差し替えできない）
-    if ($KojinNo) {
-        $hits = Get-KojinNoHitCount -Pages $pages -KojinNo $KojinNo
-        if ($hits -eq 0) {
-            Write-Warning "記録内に宛名番号 '$KojinNo' の入力が見つかりません。このままではバッチで宛名番号を差し替えできません。"
-            Write-Warning "検索欄に宛名番号 '$KojinNo' をそのまま入力して記録し直してください。"
-        } else {
-            Write-Host "宛名番号 '$KojinNo' を記録内で $hits 箇所確認しました（バッチ実行時に差し替えます）。"
-        }
-    } elseif ($ClickNav) {
-        Write-Warning "-KojinNo が未指定です。バッチで使うには記録時の宛名番号を指定してください。"
-    }
-
-    Save-RecordedConfig -BaseCfg $Cfg -Pages $pages -OutPath $OutPath -SpaMode $script:RecSawSpa -ClickNav $ClickNav -KojinNo $KojinNo
-    Write-Host "保存先: $OutPath"
-    Write-Host "再生(全画面キャプチャ): .\powershell\cdp_capture.ps1 -Config `"$OutPath`""
+    Complete-Recording -Cfg $Cfg -OutPath $OutPath -ClickNav $ClickNav -KojinNo $KojinNo
 }
 
 # ---------------------------------------------------------------------------
@@ -1323,7 +1665,8 @@ function Get-KojinNoPattern {
     return '(?<![0-9A-Za-z])' + [regex]::Escape($KojinNo) + '(?![0-9A-Za-z])'
 }
 
-# 記録内（入力値 と goto の URL）に宛名番号が何箇所あるか
+# 記録内（入力値・クリックのボタン名/セレクタ）に宛名番号が何箇所あるか。
+# URL は数えない（URL には宛名番号以外の番号も入るため、バッチでは URL を使わない）。
 function Get-KojinNoHitCount {
     param($Pages, [string]$KojinNo)
     $pattern = Get-KojinNoPattern -KojinNo $KojinNo
@@ -1331,13 +1674,19 @@ function Get-KojinNoHitCount {
     foreach ($page in @($Pages)) {
         foreach ($a in @($page.actions)) {
             if ($a.type -eq "fill" -and $null -ne $a.value -and [regex]::IsMatch([string]$a.value, $pattern)) { $n++ }
-            elseif ($a.type -eq "goto" -and $a.url -and [regex]::IsMatch([string]$a.url, $pattern)) { $n++ }
+            elseif ($a.type -eq "click") {
+                if ($a.text -and [regex]::IsMatch([string]$a.text, $pattern)) { $n++ }
+                if ($a.selector -and [regex]::IsMatch([string]$a.selector, $pattern)) { $n++ }
+            }
         }
     }
     return $n
 }
 
-# 記録内の宛名番号（入力値 と goto の URL）を差し替える。差し替えた箇所数を返す
+# 記録内の宛名番号を差し替える。差し替えた箇所数を返す。
+#   入力値 … 宛名番号の部分を置き換える
+#   クリック … ボタン名に宛名番号が入っていたら、再生時は「新しい宛名番号を含む要素」だけで探すよう
+#              match_kojin_no を付ける（氏名は人ごとに違うので照合に使わない）。セレクタ内の番号も置き換える
 function Update-KojinNo {
     param($Cfg, [string]$From, [string]$To)
     $pattern = Get-KojinNoPattern -KojinNo $From
@@ -1348,8 +1697,15 @@ function Update-KojinNo {
             if ($a.type -eq "fill" -and $null -ne $a.value -and [regex]::IsMatch([string]$a.value, $pattern)) {
                 $a.value = [regex]::Replace([string]$a.value, $pattern, $replacement); $n++
             }
-            elseif ($a.type -eq "goto" -and $a.url -and [regex]::IsMatch([string]$a.url, $pattern)) {
-                $a.url = [regex]::Replace([string]$a.url, $pattern, $replacement); $n++
+            elseif ($a.type -eq "click") {
+                if ($a.text -and [regex]::IsMatch([string]$a.text, $pattern)) {
+                    $a.text = $To
+                    $a | Add-Member -NotePropertyName match_kojin_no -NotePropertyValue $To -Force
+                    $n++
+                }
+                if ($a.selector -and [regex]::IsMatch([string]$a.selector, $pattern)) {
+                    $a.selector = [regex]::Replace([string]$a.selector, $pattern, $replacement); $n++
+                }
             }
         }
     }
@@ -1378,6 +1734,10 @@ function Invoke-Batch {
     $runTs   = Get-Date -Format "yyyyMMdd_HHmmss"
     $outRoot = if ($map.output_dir) { [string]$map.output_dir } else { "output" }
     $runDir  = Join-Path $outRoot "batch_$runTs"
+    # 連続失敗がこの数に達した記録は中断する（ログアウトやシステム異常で全件失敗し続けるのを防ぐ）
+    $maxFail  = if ($null -ne $map.max_consecutive_fail) { [int]$map.max_consecutive_fail } else { 5 }
+    # 件と件の間の待ち(ms)
+    $interval = if ($null -ne $map.interval_ms) { [int]$map.interval_ms } else { 1000 }
 
     Write-Host "=== バッチ実行 ==="
     Write-Host "CSV    : $CsvFile"
@@ -1388,6 +1748,8 @@ function Invoke-Batch {
     $done    = New-Object System.Collections.Generic.List[string]
     $skipped = New-Object System.Collections.Generic.List[string]
     $failed  = New-Object System.Collections.Generic.List[string]
+    $consecutiveFail = @{}   # 記録の論理名 → 連続失敗数
+    $abortedRecords  = @{}   # 連続失敗で中断した記録の論理名
 
     # 列数が合わず読み飛ばした行
     foreach ($bad in $csv.Invalid) {
@@ -1418,6 +1780,10 @@ function Invoke-Batch {
             $skipped.Add("$label : 対応表(items)に未登録"); continue
         }
         $recName = [string]$itemProp.Value
+        if ($abortedRecords.ContainsKey($recName)) {
+            Write-Warning "スキップ: 記録 '$recName' は連続 $maxFail 件失敗したため中断しています"
+            $skipped.Add("$label : 記録 '$recName' は連続失敗で中断中"); continue
+        }
         $recProp = $map.records.PSObject.Properties[$recName]
         if (-not $recProp) {
             Write-Warning "スキップ: 対応表の records に記録名 '$recName' が登録されていません"
@@ -1435,9 +1801,20 @@ function Invoke-Batch {
             Write-Warning "スキップ: 記録ファイルを読めません: $recPath"
             $skipped.Add("$label : 記録ファイルを読めない"); continue
         }
+        if ($cfg.click_nav -ne $true) {
+            Write-Warning "スキップ: 記録 '$recName' はバッチ用の記録ではありません。-ClickNav（GUIは「バッチ用に記録」）で記録し直してください"
+            $skipped.Add("$label : バッチ用の記録ではない"); continue
+        }
         if (-not $cfg.kojin_no) {
             Write-Warning "スキップ: 記録 '$recName' に kojin_no（記録時の宛名番号）がありません。-KojinNo を付けて記録し直してください"
             $skipped.Add("$label : 記録に kojin_no がない"); continue
+        }
+        # URL での移動(goto)を含む記録は使わない（URLに世帯番号などが入り、別の人の画面を開くことがある）
+        $gotoCount = 0
+        foreach ($pg in @($cfg.pages)) { foreach ($a in @($pg.actions)) { if ($a.type -eq "goto") { $gotoCount++ } } }
+        if ($gotoCount -gt 0) {
+            Write-Warning "スキップ: 記録 '$recName' に URL での移動(goto)が $gotoCount 箇所あります。別の人の画面を開くおそれがあるため、バッチ用に記録し直してください"
+            $skipped.Add("$label : 記録に URL での移動(goto)を含む"); continue
         }
 
         # 宛名番号の差し替え。1箇所も無ければ記録時の人を撮ってしまうのでスキップ
@@ -1453,14 +1830,31 @@ function Invoke-Batch {
         $folder = Join-Path $runDir (ConvertTo-SafeFileName "${recName}_${dai}")
         $prefix = ConvertTo-SafeFileName "$($p.KojinNo)_${dai}_${sho}"
 
+        # バッチ実行中は本物のマウス・キー入力で操作し、合わなければその件を打ち切る
+        $script:BatchMode = $true
+        $itemOk = $false
         try {
             $ok = @(Invoke-Capture -Cfg $cfg -OutDir $folder -FilePrefix $prefix)[-1]
-            if ($ok -eq $true) { $done.Add($label) }
+            if ($ok -eq $true) { $done.Add($label); $itemOk = $true }
             else { $failed.Add("$label : 対象タブが見つからない") }
         } catch {
-            Write-Warning "失敗: $($_.Exception.Message)"
+            Write-Warning "失敗（この件を打ち切り）: $($_.Exception.Message)"
             $failed.Add("$label : $($_.Exception.Message)")
+        } finally {
+            $script:BatchMode = $false
         }
+
+        if ($itemOk) {
+            $consecutiveFail[$recName] = 0
+        } else {
+            $consecutiveFail[$recName] = [int]$consecutiveFail[$recName] + 1
+            if ($consecutiveFail[$recName] -ge $maxFail) {
+                # 連続で失敗する＝システム側の異常か記録の陳腐化。この記録を使う残りの行は飛ばす
+                $abortedRecords[$recName] = $true
+                Write-Warning "記録 '$recName' が連続 $($consecutiveFail[$recName]) 件失敗したため、この記録を使う残りの行は中断します。"
+            }
+        }
+        if ($interval -gt 0) { Start-Sleep -Milliseconds $interval }
     }
 
     Write-Host ""

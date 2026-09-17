@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>練習ページ: 宛名番号サジェスト</title>
+<style>
+  body { font-family: "Meiryo", sans-serif; margin: 0; }
+  .app-header { background: #2d4a6e; padding: 8px 16px; }
+  .nav-link { color: #fff; text-decoration: none; }
+  main { padding: 16px; }
+  .atena-input { width: 220px; padding: 4px; }
+  .suggest-overlay { position: absolute; background: #fff; border: 1px solid #999; min-width: 220px; z-index: 1000; }
+  .suggest-overlay ul { list-style: none; margin: 0; padding: 0; }
+  .suggest-option { padding: 4px 8px; cursor: pointer; }
+  .suggest-option:hover { background: #dde8f5; }
+  .empty { padding: 4px 8px; color: #888; }
+  .tabs { display: flex; gap: 4px; margin: 12px 0; }
+  .tab { border: 1px solid #999; padding: 4px 12px; cursor: pointer; }
+  .tab-body { border: 1px solid #ccc; padding: 12px; }
+</style>
+</head>
+<body>
+<!--
+  cas_cap のバッチ用記録（宛名番号を入力 → サジェスト候補を選択）を検証するための練習ページ。
+  実在システムの値は使っていない。業務システムで見られる次のくせを再現している。
+    1. 検索はキーを離した時（keyup）だけ動く。プログラムから input イベントを投げても候補は出ない
+    2. 候補はマウスを押した瞬間（mousedown）に選ばれ、その時点で候補リストが消える（click は候補に届かない）
+    3. 候補リストは body 直下の別レイヤーに描かれ、前に入る要素の数やIDが毎回変わる
+    4. 候補を選ぶと、表示名を入力欄へ書き戻して change を発火する
+    5. 選択後、少し遅れて画面が変わる。URL には宛名番号ではなく世帯番号と内部キーが入る
+  ?label=name を付けると、候補の表示名が氏名だけ（宛名番号なし）になる。
+  画面の動きは window.__mockLog に積まれる（検証用）。
+-->
+<header class="app-header"><a href="#/search" class="nav-link">宛名検索</a></header>
+<main id="view"></main>
+<script>
+(function () {
+  var labelMode = new URLSearchParams(location.search).get('label') === 'name' ? 'name' : 'number';
+  var PEOPLE = [
+    { atena: '11111',  name: '山田 太郎', setai: '90001', key: 'k7f3' },
+    { atena: '111119', name: '田中 次郎', setai: '90004', key: 'k1a9' },
+    { atena: '222222', name: '佐藤 花子', setai: '90002', key: 'k5c2' },
+    { atena: '333333', name: '鈴木 一郎', setai: '90003', key: 'k9d8' }
+  ];
+  window.__mockLog = [];
+  var overlay = null, timer = null;
+
+  function rid() { return 'pv_id_' + Math.floor(Math.random() * 1000); }
+  function labelOf(p) { return labelMode === 'name' ? p.name : (p.atena + ' ' + p.name); }
+  function closeOverlay() {
+    if (overlay) { overlay.remove(); overlay = null; }
+    Array.prototype.forEach.call(document.querySelectorAll('.overlay-spacer'), function (d) { d.remove(); });
+  }
+
+  function render() {
+    closeOverlay();
+    var h = location.hash || '#/search';
+    var view = document.getElementById('view');
+
+    if (h.indexOf('#/detail') === 0) {
+      var q = new URLSearchParams(h.split('?')[1] || '');
+      var p = PEOPLE.filter(function (x) { return x.key === q.get('k'); })[0];
+      if (!p) { view.innerHTML = '<p>対象がありません</p>'; return; }
+      view.innerHTML =
+        '<section class="detail"><h2>宛名詳細</h2>' +
+        '<p class="person">宛名番号 <span class="atena">' + p.atena + '</span> ／ 氏名 <span class="name">' + p.name + '</span></p>' +
+        '<div class="tabs"><div class="tab" data-tab="基本">基本</div><div class="tab" data-tab="履歴">履歴</div><div class="tab" data-tab="世帯">世帯</div></div>' +
+        '<div class="tab-body">基本: ' + p.name + '</div></section>';
+      window.__mockLog.push({ view: 'detail', atena: p.atena });
+      Array.prototype.forEach.call(view.querySelectorAll('.tab'), function (t) {
+        t.addEventListener('click', function () {
+          view.querySelector('.tab-body').textContent = t.dataset.tab + ': ' + p.name;
+          window.__mockLog.push({ view: 'tab', atena: p.atena, tab: t.dataset.tab });
+        });
+      });
+      return;
+    }
+
+    var id = rid();
+    view.innerHTML =
+      '<section class="search"><h2>宛名検索</h2>' +
+      '<label for="' + id + '_input">宛名番号</label> <input id="' + id + '_input" class="atena-input" autocomplete="off"></section>';
+    var input = view.querySelector('.atena-input');
+    // くせ1: キーを離した時だけ検索する
+    input.addEventListener('keyup', function () {
+      clearTimeout(timer);
+      var v = input.value.trim();
+      if (!v) { closeOverlay(); return; }
+      timer = setTimeout(function () { search(input, v); }, 300);
+    });
+  }
+
+  function search(input, v) {
+    setTimeout(function () {                       // サーバ問い合わせの代わり
+      if (input.value.trim() !== v) return;
+      var hits = PEOPLE.filter(function (p) { return p.atena.indexOf(v) === 0; });
+      closeOverlay();
+      // くせ3: 前に入る要素の数が毎回変わる（位置の指定がずれる）
+      var n = Math.floor(Math.random() * 3);
+      for (var i = 0; i < n; i++) {
+        var d = document.createElement('div'); d.className = 'overlay-spacer'; document.body.appendChild(d);
+      }
+      overlay = document.createElement('div');
+      overlay.className = 'suggest-overlay';
+      overlay.id = rid() + '_list';
+      var r = input.getBoundingClientRect();
+      overlay.style.left = (r.left + window.scrollX) + 'px';
+      overlay.style.top = (r.bottom + window.scrollY) + 'px';
+      if (!hits.length) {
+        overlay.innerHTML = '<div class="empty">該当なし</div>';
+        document.body.appendChild(overlay);
+        return;
+      }
+      var ul = document.createElement('ul');
+      ul.setAttribute('role', 'listbox');
+      hits.forEach(function (p, idx) {
+        var li = document.createElement('li');
+        li.setAttribute('role', 'option');
+        li.className = 'suggest-option';
+        li.id = overlay.id + '_' + idx;
+        li.textContent = labelOf(p);
+        // くせ2: マウスを押した瞬間に選ぶ
+        li.addEventListener('mousedown', function (e) { e.preventDefault(); choose(input, p); });
+        ul.appendChild(li);
+      });
+      overlay.appendChild(ul);
+      document.body.appendChild(overlay);
+    }, 400);
+  }
+
+  function choose(input, p) {
+    // くせ4: 表示名を入力欄へ書き戻して change を発火
+    input.value = labelOf(p);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    closeOverlay();
+    window.__mockLog.push({ view: 'select', atena: p.atena });
+    // くせ5: 少し遅れて遷移。URL には世帯番号と内部キー
+    setTimeout(function () { location.hash = '#/detail?setai=' + p.setai + '&k=' + p.key; }, 500);
+  }
+
+  window.addEventListener('hashchange', render);
+  render();
+})();
+</script>
+</body>
+</html>
